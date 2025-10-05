@@ -46,21 +46,22 @@ def main():
         "k_phase": args.k_phase
     }, indent=2))
 
-    # 1) 加载原始数据（移除闰日）——允许缺失流量可用 --allow_missing_u
+    # 1) Load raw data (remove leap days) — allow missing discharge via --allow_missing_u
     runner = TenYearUnifiedRunner(args.csv_dir, seq_length=args.seq_length, pred_length=args.pred_length)
     data = runner.load_range_data(args.start_year, args.end_year, allow_missing_u=args.allow_missing_u)
     if len(data) == 0:
         raise RuntimeError("No usable days found. Check CSV_DIR and filenames.")
 
-    # 2) 用训练年(2015–2022)计算逐日 climatology（doy: 1..365；index 0 为空位）
+    # 2) Compute daily climatology using training years (2015–2022) (DOY: 1..365; index 0 is padding)
     clim_vec = build_climatology_from_train_years(data, train_years=runner.train_years)
     runner.set_climatology(clim_vec)
 
-    # 3) 组装样本（特征6通道，目标为绝对 h 序列；训练时转为 anomaly）
+    # 3) Build samples (6 feature channels; target is absolute h sequence;
+    # converted to anomaly during training)
     X, Y, tgt_season, tgt_dates = runner.prepare_sequences_no_season(data)
     print(f"Samples built: X={X.shape}, Y={Y.shape}")
 
-    # 4) 训练（验证集=2023 干/湿两窗；测试集=2024 干/湿两窗）
+    # 4) Train (validation = 2023 dry/wet windows; test = 2024 dry/wet windows)
     t0 = time.time()
     hist = runner.train_with_dual_window_val(
         X, Y, tgt_season, tgt_dates,
@@ -72,31 +73,30 @@ def main():
     t1 = time.time()
     print(f"Training finished in {(t1 - t0)/60.0:.1f} min")
 
-    # 5) 评估（打印 RMSE/MAE）并导出“四件套”
-    # 5.1 权重（注意：TF checkpoint 会生成 .index 和 .data-00000-of-00001 两个文件）
+    # 5) Evaluate (print RMSE/MAE) and export the “four artifacts”
+    # 5.1 Weights (note: TF checkpoint creates two files: .index and .data-00000-of-00001)
     ckpt_prefix = os.path.join(args.weights_dir, args.ckpt_name)
     runner.model.save_weights(ckpt_prefix)
     print(f"Saved weights to prefix: {ckpt_prefix}*")
 
-    # 5.2 气候基线
+    # 5.2 Climatology baseline
     clim_path = os.path.join(args.artifacts_dir, "clim_vec.npy")
     np.save(clim_path, runner.clim)
     print(f"Saved climatology: {clim_path}")
 
-    # 5.3 归一化统计
+    # 5.3 Normalization statistics
     norm_path = os.path.join(args.artifacts_dir, "norm_stats.json")
     with open(norm_path, "w", encoding="utf-8") as f:
         json.dump(runner.norm_stats, f, ensure_ascii=False, indent=2)
     print(f"Saved norm stats: {norm_path}")
 
-    # 5.4 相位报告（2023 扫 k* → 应用于 2024）
+    # 5.4 Phase report (scan k* on 2023 → apply to 2024)
     phase_report = runner.phase_vs_amplitude_report(K=args.k_phase)
     phase_path = os.path.join(args.artifacts_dir, "phase_report.json")
     with open(phase_path, "w", encoding="utf-8") as f:
         json.dump(phase_report, f, ensure_ascii=False, indent=2)
     print(f"Saved phase report: {phase_path}")
 
-    # 额外：保存训练曲线（loss）
     hist_path = os.path.join(args.artifacts_dir, "train_history.json")
     try:
         # Keras History -> dict(list)
