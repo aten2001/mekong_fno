@@ -35,9 +35,10 @@ def build_climatology_from_train_years(data, train_years=(2015, 2022)) -> np.nda
     return clim_vec
 
 # - TenYearUnifiedRunner (includes: load_range_data / prepare_sequences_no_season / _norm_inputs /
-#   train_with_dual_window_val / _denorm_pred_anom / evaluate_all / get_daily_h_df /
-#   _series_true_pred7_by_idx / _rmse_with_shift / _scan_best_shift / phase_vs_amplitude_report /
-#   and the unified predict_* interfaces below)
+# train_with_dual_window_val / _denorm_pred_anom / evaluate_all / get_daily_h_df /
+# _series_true_pred7_by_idx / _rmse_with_shift / scan_best_shift / phase_vs_amplitude_report /
+# and the unified predict* interfaces below)
+
 class TenYearUnifiedRunner:
     def __init__(self, csv_files_path, seq_length=90, pred_length=7):
         self.csv_files_path = csv_files_path
@@ -64,7 +65,7 @@ class TenYearUnifiedRunner:
     # ---------- Load ~10 years of data with leap day removed ----------
     def load_range_data(self, start_year=2015, end_year=2024,
                         allow_missing_u=False, u_fill_strategy="ffill_then_mean"):
-        # print(f"Loading {self.station_info['name']} station {start_year}-{end_year} data...")
+        # print(f"加载 {self.station_info['name']} station {start_year}-{end_year} data...")
         print(f"Loading station {self.station_info['name']} data for {start_year}-{end_year} ...")
         wl_file = f"{self.csv_files_path}/Water Level.ManualKH_{self.station_info['code']:06d}_{self.station_info['name']}.csv"
         q_file = f"{self.csv_files_path}/Discharge.Calculated daily dischargeKH_{self.station_info['code']:06d}_{self.station_info['name']}.csv"
@@ -308,16 +309,21 @@ class TenYearUnifiedRunner:
         alpha = tf.Variable(0.10, trainable=False, dtype=tf.float32)  # weight for correlation term
 
         def step_corr_loss(y_true, y_pred):
-            # weighted MSE (near steps larger)
-            se = tf.square(y_true - y_pred)[:, :, 0]  # [B, 7]
-            mse = tf.reduce_mean(se * w_steps)  # scalar
-            # correlation term (encourage phase alignment)
-            yt = tf.reshape(y_true, [-1]);
-            yp = tf.reshape(y_pred, [-1])
-            yt = yt - tf.reduce_mean(yt);
-            yp = yp - tf.reduce_mean(yp)
-            corr = tf.reduce_sum(yt * yp) / (tf.sqrt(tf.reduce_sum(yt ** 2)) * tf.sqrt(tf.reduce_sum(yp ** 2)) + 1e-8)
-            return mse + alpha * (1.0 - corr)
+            # per-sample weighted MSE over 7 steps → [B]
+            se = tf.square(y_true - y_pred)[:, :, 0]  # [B,7]
+            mse_per_sample = tf.reduce_mean(se * w_steps, axis=1)  # [B]
+
+            # per-sample correlation over 7 steps → [B]
+            yt = y_true[:, :, 0]  # [B,7]
+            yp = y_pred[:, :, 0]  # [B,7]
+            yt = yt - tf.reduce_mean(yt, axis=1, keepdims=True)
+            yp = yp - tf.reduce_mean(yp, axis=1, keepdims=True)
+            num = tf.reduce_sum(yt * yp, axis=1)  # [B]
+            den = tf.sqrt(tf.reduce_sum(yt ** 2, axis=1) * tf.reduce_sum(yp ** 2, axis=1) + 1e-8)
+            corr = num / den  # [B]
+
+            # 返回 [B]，与 sample_weight=[B] 完美匹配
+            return mse_per_sample + alpha * (1.0 - corr)
 
         class AlphaScheduler(tf.keras.callbacks.Callback):
             """0-10:0.10 → 11-30:linear to 0.20 → 31-39:0.20 → ≥40:back to 0.10"""
@@ -555,7 +561,7 @@ class TenYearUnifiedRunner:
         2) Apply those k* to corresponding 2024 windows and report aligned RMSEs;
         3) Return a dict with all numbers.
         """
-        ids = self.idxs  # saved during training
+        ids = self.idxs  # Saved during the training function
         report = {"val": {}, "test_applied": {}}
 
         # ---- 2023: merged / dry / wet ----
@@ -600,7 +606,6 @@ class TenYearUnifiedRunner:
         days = pd.date_range(start_date, end_date, freq="D")
         days = days[~((days.month == 2) & (days.day == 29))]
         if len(days) < L:
-            # Rare case crossing Feb 29: backfill earlier days to reach length L
             d = start_date - pd.Timedelta(days=1)
             buf = []
             while len(days) + len(buf) < L:
@@ -702,7 +707,6 @@ class TenYearUnifiedRunner:
             d -= pd.Timedelta(days=1)
         days = days[::-1]  # Ascending in time
 
-        # time_idx: index days from the training start date (2015-01-01) in non-leap-day order (skip Feb 29)
         # build 6-channel inputs; x_pos=0.0; u not used
         def _time_idx_for_date(dt: pd.Timestamp) -> int:
             base = pd.Timestamp(f"{self.train_years[0]}-01-01")
@@ -710,8 +714,6 @@ class TenYearUnifiedRunner:
             all_days = all_days[~((all_days.month == 2) & (all_days.day == 29))]
             return len(all_days) - 1
 
-        # Build 6-channel input features
-        # x_pos fixed at 0.0; u not used
         # build 6-channel inputs; x_pos=0.0; u not used
         h_vals = []
         for dt in days:
