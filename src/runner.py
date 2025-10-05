@@ -344,7 +344,7 @@ class TenYearUnifiedRunner:
             modes=64, width=96, num_layers=4,
             input_features=X.shape[2], dropout_rate=0.1, l2=1e-5
         )
-        self.model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=step_corr_loss)
+        self.model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=step_corr_loss, weighted_metrics=[])
 
         callbacks = [
             AlphaScheduler(),
