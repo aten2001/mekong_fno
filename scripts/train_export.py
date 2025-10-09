@@ -1,6 +1,7 @@
 # scripts/train_export.py
 import os
 import json
+import sys
 import time
 import argparse
 import numpy as np
@@ -27,6 +28,14 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # 0) Validate output paths first
+    for d in [args.artifacts_dir, args.weights_dir]:
+        if os.path.exists(d) and not os.path.isdir(d):
+            print(f"Error: {os.path.abspath(d)} exists but is not a directory!")
+            print("Please remove or rename that file, then rerun.")
+            sys.exit(1)
+
+    # 1) Create directories
     os.makedirs(args.artifacts_dir, exist_ok=True)
     os.makedirs(args.weights_dir,   exist_ok=True)
 
@@ -40,28 +49,27 @@ def main():
         "batch_size": args.batch_size,
         "tau_years": args.tau_years,
         "allow_missing_u": args.allow_missing_u,
-        "artifacts_dir": args.artifacts_dir,
-        "weights_dir": args.weights_dir,
+        "artifacts_dir": os.path.abspath(args.artifacts_dir),
+        "weights_dir": os.path.abspath(args.weights_dir),
         "ckpt_name": args.ckpt_name,
         "k_phase": args.k_phase
     }, indent=2))
 
-    # 1) Load raw data (remove leap days) — allow missing discharge via --allow_missing_u
+    # 2) Load data (remove leap days)
     runner = TenYearUnifiedRunner(args.csv_dir, seq_length=args.seq_length, pred_length=args.pred_length)
     data = runner.load_range_data(args.start_year, args.end_year, allow_missing_u=args.allow_missing_u)
     if len(data) == 0:
         raise RuntimeError("No usable days found. Check CSV_DIR and filenames.")
 
-    # 2) Compute daily climatology using training years (2015–2022) (DOY: 1..365; index 0 is padding)
+    # 3) Compute and inject the climatology (using training years 2015–2022)
     clim_vec = build_climatology_from_train_years(data, train_years=runner.train_years)
     runner.set_climatology(clim_vec)
 
-    # 3) Build samples (6 feature channels; target is absolute h sequence;
-    # converted to anomaly during training)
+    # 4) Build samples
     X, Y, tgt_season, tgt_dates = runner.prepare_sequences_no_season(data)
     print(f"Samples built: X={X.shape}, Y={Y.shape}")
 
-    # 4) Train (validation = 2023 dry/wet windows; test = 2024 dry/wet windows)
+    # 5) Train
     t0 = time.time()
     hist = runner.train_with_dual_window_val(
         X, Y, tgt_season, tgt_dates,
@@ -70,36 +78,59 @@ def main():
         use_time_decay=True,
         tau_years=args.tau_years
     )
-    t1 = time.time()
-    print(f"Training finished in {(t1 - t0)/60.0:.1f} min")
+    print(f"Training finished in {(time.time() - t0)/60.0:.1f} min")
 
-    # 5) Evaluate (print RMSE/MAE) and export the “four artifacts”
-    # 5.1 Weights (note: TF checkpoint creates two files: .index and .data-00000-of-00001)
+    # 6) evaluation: this prints the Val/Test window metrics plus the 2024 weighted metrics
+    eval_res = runner.evaluate_all()
+
+    # 7) Phase/amplitude diagnosis: compute once and reuse later when writing to disk
+    print("\n=== Phase/Amplitude attribution: search k on 2023 and fix on 2024 as a transparent baseline ===")
+    phase_report = runner.phase_vs_amplitude_report(K=args.k_phase)
+
+    # 8) Export
+    # 8.1 Export the weights
     ckpt_prefix = os.path.join(args.weights_dir, args.ckpt_name)
     runner.model.save_weights(ckpt_prefix)
     print(f"Saved weights to prefix: {ckpt_prefix}*")
 
-    # 5.2 Climatology baseline
+    # 8.2 Export the climatology baseline
     clim_path = os.path.join(args.artifacts_dir, "clim_vec.npy")
     np.save(clim_path, runner.clim)
     print(f"Saved climatology: {clim_path}")
 
-    # 5.3 Normalization statistics
+    # 8.3 Export normalized statistics
     norm_path = os.path.join(args.artifacts_dir, "norm_stats.json")
     with open(norm_path, "w", encoding="utf-8") as f:
         json.dump(runner.norm_stats, f, ensure_ascii=False, indent=2)
     print(f"Saved norm stats: {norm_path}")
 
-    # 5.4 Phase report (scan k* on 2023 → apply to 2024)
-    phase_report = runner.phase_vs_amplitude_report(K=args.k_phase)
+    # 8.4 Export phase report
     phase_path = os.path.join(args.artifacts_dir, "phase_report.json")
     with open(phase_path, "w", encoding="utf-8") as f:
         json.dump(phase_report, f, ensure_ascii=False, indent=2)
     print(f"Saved phase report: {phase_path}")
 
+    # 8.5 Export metrics
+    def _trim_metrics(d):
+        return {
+            "h_rmse": float(d.get("h_rmse", float("nan"))),
+            "h_mae": float(d.get("h_mae", float("nan"))),
+            "n": int(d.get("n", 0)),
+            "title": str(d.get("title", "")),
+        }
+
+    eval_res_small = {}
+    for key, val in eval_res.items():
+        eval_res_small[key] = _trim_metrics(val)
+
+    metrics_path = os.path.join(args.artifacts_dir, "test_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(eval_res_small, f, ensure_ascii=False, indent=2)
+    print(f"Saved eval metrics: {metrics_path}")
+
+    # 8.6 Export training curves
     hist_path = os.path.join(args.artifacts_dir, "train_history.json")
     try:
-        # Keras History -> dict(list)
         h = hist.history if hasattr(hist, "history") else {}
         with open(hist_path, "w", encoding="utf-8") as f:
             json.dump(h, f, ensure_ascii=False, indent=2)
@@ -109,7 +140,7 @@ def main():
 
     print("\nExported artifacts:")
     print(" - Weights:", ckpt_prefix, "[.index, .data-00000-of-00001]")
-    print(" - Artifacts:", clim_path, norm_path, phase_path, hist_path)
+    print(" - Artifacts:", clim_path, norm_path, phase_path, metrics_path, hist_path)
 
 if __name__ == "__main__":
     main()
