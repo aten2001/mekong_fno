@@ -142,5 +142,18 @@ def main():
     for m,(_,wa) in w.items():
         print(f"{m:<6}: {wa:.3f}")
 
+    # ===== 6) Persist comparison results (CSV/JSON) =====
+    os.makedirs(ART_DIR, exist_ok=True)
+    out_csv = os.path.join(ART_DIR, "eval_compare.csv")
+    out_json= os.path.join(ART_DIR, "eval_compare.json")
+    df.to_csv(out_csv, index=False)
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump({
+            "by_window": rows,
+            "test_2024_weighted": {m: {"rmse": float(w[m][0]), "mae": float(w[m][1])} for m in w}
+        }, f, ensure_ascii=False, indent=2)
+    print(f"\nSaved: {out_csv}")
+    print(f"Saved: {out_json}")
+
 if __name__ == "__main__":
     main()
