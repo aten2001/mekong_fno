@@ -1,0 +1,250 @@
+# app/app.py
+import os, json, glob, time
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import gradio as gr
+from zoneinfo import ZoneInfo
+
+from src.runner import TenYearUnifiedRunner, doy_sin_cos_series
+from src.model_fno import SeasonalFNO1D
+
+SEQ_LENGTH = 120
+PRED_LENGTH = 7
+ART_DIR = "artifacts"
+WEIGHTS_DIR = "weights"
+CSV_DIR = os.environ.get("CSV_DIR", ".")
+CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
+NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
+PHASE_JSON = os.path.join(ART_DIR, "phase_report.json")
+
+
+def _find_ckpt(weights_dir=WEIGHTS_DIR):
+    ckpt = tf.train.latest_checkpoint(weights_dir)
+    if ckpt: return ckpt
+    idx = glob.glob(os.path.join(weights_dir, "*.ckpt.index"))
+    if idx:  return idx[0].replace(".index","")
+    raise FileNotFoundError("No TF checkpoint found in 'weights/'")
+
+def _today_utc7_date():
+    try:
+        tz = ZoneInfo("Asia/Bangkok")
+        return pd.Timestamp.now(tz=tz).date()
+    except Exception:
+        return pd.Timestamp.utcnow().date()
+
+def _norm_inputs_like_train(X, st):
+    Xn = X.copy()
+    Xn[:, :, 0] = (Xn[:, :, 0] - st['t_mean']) / (st['t_std'] + 1e-8)
+    Xn[:, :, 2] = (Xn[:, :, 2] - st['h_in_mean']) / (st['h_in_std'] + 1e-8)
+    Xn[:, :, 3] = (Xn[:, :, 3] - st['dh_in_mean']) / (st['dh_in_std'] + 1e-8)
+    return Xn
+
+def _build_window_Xn(runner, water_daily: pd.Series, date_anchor: pd.Timestamp):
+    """
+    runner.predict_h_range’s window construction
+    and normalization (build only Xn and the next 7 dates)
+    """
+    date_anchor = pd.to_datetime(date_anchor).normalize()
+    L = int(SEQ_LENGTH)
+    # Collect L days backward from the end (skip Feb 29)
+    days = []
+    d = date_anchor
+    while len(days) < L:
+        if not (d.month == 2 and d.day == 29):
+            days.append(d)
+        d -= pd.Timedelta(days=1)
+    days = days[::-1]  # ascending order
+
+    # 6 channels: time_idx, x_pos(0), h, dh1, doy_sin, doy_cos
+    def _time_idx_for_date(dt: pd.Timestamp) -> int:
+        base = pd.Timestamp(f"{runner.train_years[0]}-01-01")
+        all_days = pd.date_range(base, dt, freq='D')
+        all_days = all_days[~((all_days.month==2) & (all_days.day==29))]
+        return len(all_days) - 1
+
+    # h and dh1
+    h_vals = []
+    for dt in days:
+        key = getattr(dt, "date", lambda: dt)()
+        if key not in water_daily.index:
+            raise ValueError(f"Missing water level for {dt.date()}, need continuous daily series.")
+        h_vals.append(float(water_daily[key]))
+    h_vals = np.asarray(h_vals, np.float32)
+    dh1 = np.concatenate([[0.0], np.diff(h_vals)]).astype(np.float32)
+    t_idx = np.asarray([_time_idx_for_date(dt) for dt in days], np.float32)
+    x_pos = np.zeros_like(t_idx, np.float32)
+    doy_sin, doy_cos = doy_sin_cos_series(days)
+
+    feats6 = np.stack([t_idx, x_pos, h_vals, dh1, doy_sin, doy_cos], axis=1).astype(np.float32)
+    st = runner.norm_stats
+    Xn = feats6.copy()[None, :, :]
+    Xn[:, :, 0] = (Xn[:, :, 0] - st['t_mean'])   / (st['t_std'] + 1e-8)
+    Xn[:, :, 2] = (Xn[:, :, 2] - st['h_in_mean'])/ (st['h_in_std'] + 1e-8)
+    Xn[:, :, 3] = (Xn[:, :, 3] - st['dh_in_mean'])/(st['dh_in_std'] + 1e-8)
+
+    # next 7 days (remove Feb 29; pad if a boundary is encountered)
+    fut_dates = pd.date_range(date_anchor + pd.Timedelta(days=1), periods=PRED_LENGTH, freq='D')
+    fut_dates = fut_dates[~((fut_dates.month==2) & (fut_dates.day==29))]
+    while len(fut_dates) < PRED_LENGTH:
+        fut_dates = fut_dates.append(fut_dates[-1:] + pd.Timedelta(days=1))
+        fut_dates = fut_dates[~((fut_dates.month==2) & (fut_dates.day==29))]
+    return Xn, fut_dates
+
+def _predict_7_abs(runner, Xn, fut_dates, training=False):
+    """
+    forward: standardized anomaly → de-standardize → add back climatology
+    (use the 7th-day DOY for all steps, consistent with training/evaluation)
+    """
+    y_pred_n = runner.model(Xn, training=training).numpy()  # [1,7,1]
+    st = runner.norm_stats
+    y_pred_anom = (y_pred_n * st['h_std'] + st['h_mean'])[0, :, 0]  # [7]
+    # Add the 7th-day DOY to the entire sequence back
+    from src.runner import doy_no_leap
+    tgt_day = pd.to_datetime(fut_dates[-1]).normalize()
+    tgt_doy = doy_no_leap(tgt_day)
+    clim_add = np.full((PRED_LENGTH,), float(runner.clim[tgt_doy]), dtype=np.float32)
+    return (y_pred_anom + clim_add).astype(np.float32)
+
+# ----------------- Runtime Singleton Cache (avoid repeated loading) -----------------
+_APP_CACHE = dict()
+
+def _load_service():
+    """model/runner/daily series; load only once"""
+    if _APP_CACHE.get("ready"):
+        return _APP_CACHE
+    t0 = time.perf_counter()
+    runner = TenYearUnifiedRunner(CSV_DIR, seq_length=SEQ_LENGTH, pred_length=PRED_LENGTH)
+    data = runner.load_range_data(2015, 2025, allow_missing_u=True)
+    # build clim & norm
+    runner.set_climatology(np.load(CLIM_PATH))
+    st = json.load(open(NORM_PATH, "r", encoding="utf-8"))
+    runner.norm_stats = st
+    # model
+    model = SeasonalFNO1D(modes=64, width=96, num_layers=4, input_features=6, dropout_rate=0.1, l2=1e-5)
+    _ = model(np.zeros((1, SEQ_LENGTH, 6), dtype=np.float32), training=False)
+    model.load_weights(_find_ckpt())
+    runner.model = model
+
+    # Daily series: water_daily
+    df = pd.DataFrame(data, columns=['time_idx','x_pos','u','h','ts'])
+    df['date'] = pd.to_datetime(df['ts']).dt.date
+    water_daily = df.groupby('date')['h'].mean()  # pandas.Series: index=date -> value=h(m)
+
+    _APP_CACHE.update(dict(runner=runner, water_daily=water_daily, ready=True))
+    print(f"[app] loaded in {time.perf_counter()-t0:.2f}s, days={len(water_daily)}")
+    return _APP_CACHE
+
+# ----------------- Tab 1: Today → 7 Days -----------------
+def ui_predict_today(show_uncertainty=False, mc_samples=30):
+    S = _load_service()
+    runner, water_daily = S["runner"], S["water_daily"]
+
+    # Choose the window end: prefer “today (UTC+07)”;
+    # if data is missing, fall back to the last observed day
+    today = _today_utc7_date()
+    anchor = today if today in water_daily.index else max(water_daily.index)
+    if len(water_daily) < SEQ_LENGTH:
+        return None, f"Not enough data for a {SEQ_LENGTH}-day window (currently {len(water_daily)} days).", None
+
+    # Build Xn and the future dates
+    try:
+        Xn, fut_dates = _build_window_Xn(runner, water_daily, pd.Timestamp(anchor))
+    except Exception as e:
+        return None, f"Failed to build input window: {e}", None
+
+    # Central (deterministic) prediction
+    t0 = time.perf_counter()
+    y_abs = _predict_7_abs(runner, Xn, fut_dates, training=False)   # [7]
+    latency_ms = (time.perf_counter()-t0)*1000
+
+    # Uncertainty (MC Dropout)
+    lo = hi = None
+    if show_uncertainty:
+        N = int(mc_samples)
+        Ys = []
+        for _ in range(N):
+            Ys.append(_predict_7_abs(runner, Xn, fut_dates, training=True))
+        Ys = np.stack(Ys, axis=0)  # [N,7]
+        lo, hi = np.percentile(Ys, [10, 90], axis=0)  # 10–90% interval
+
+    # plot
+    fig = plt.figure(figsize=(9.5, 4.2))
+    plt.plot(fut_dates, y_abs, label="FNO (mean)", linewidth=2)
+    if lo is not None:
+        plt.fill_between(fut_dates, lo, hi, alpha=0.18, label="MC 10–90%")
+    plt.title("7-day absolute water level (UTC+07)")
+    plt.xlabel("Date"); plt.ylabel("Water Level (m)")
+    plt.xticks(rotation=20); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+
+    # table output
+    df_out = pd.DataFrame({"date": pd.to_datetime(fut_dates).date, "h_pred": y_abs})
+    if lo is not None:
+        df_out["p10"] = lo; df_out["p90"] = hi
+
+    note = f"Window end: {anchor} ({'today' if anchor==today else 'last observed day'}); forward latency ≈ {latency_ms:.0f} ms"
+    return fig, note, df_out
+
+# ----------------- Tab 2: ΔRMSE Table -----------------
+def _load_phase_json_or_fallback():
+    """
+    Prefer reading artifacts/phase_report.json;
+    if missing, show a notice or return an empty table
+    """
+    if os.path.exists(PHASE_JSON):
+        with open(PHASE_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+def ui_phase_table(scope):
+    """
+    scope: 'merged', 'dry', 'wet'.
+    Return a DataFrame showing RMSE before/after alignment and ΔRMSE
+    (based on 2024 test_applied)
+    """
+    mapping = {"merged":"all", "dry":"dry", "wet":"wet"}
+    key = mapping.get(scope, "all")
+    rep = _load_phase_json_or_fallback()
+    if rep is None:
+        msg = "Missing artifacts/phase_report.json. Please run: python -m scripts.make_phase_report"
+        return pd.DataFrame({"message":[msg]})
+    row = rep["test_applied"][key]  # {k, rmse_before, rmse_after, gain}
+    df = pd.DataFrame([{
+        "Window": scope,
+        "k* (days)": row["k"],
+        "RMSE (raw)": round(row["rmse_before"], 3),
+        "RMSE (aligned)": round(row["rmse_after"], 3),
+        "ΔRMSE": round(row["gain"], 3),
+    }])
+    return df
+
+# ----------------- Gradio UI -----------------
+def build_app():
+    with gr.Blocks(title="Mekong FNO Demo", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("### Mekong Water Level Forecast (Stung Treng) — FNO\n- Tab1: **Forecast Today → 7 days** (optional uncertainty)\n- Tab2: **ΔRMSE alignment evaluation** (reads `artifacts/phase_report.json`)")
+
+        with gr.Tabs():
+            with gr.Tab("Forecast (Today → 7 days)"):
+                with gr.Row():
+                    btn = gr.Button("Predict Today (UTC+07)", variant="primary")
+                    ck = gr.Checkbox(value=False, label="Show uncertainty (MC Dropout)")
+                    samp = gr.Slider(10, 100, value=30, step=5, label="MC samples", interactive=True)
+                out_plot = gr.Plot()
+                out_note = gr.Markdown()
+                out_df   = gr.Dataframe(headers=["date","h_pred","p10","p90"], interactive=False)
+
+                btn.click(fn=ui_predict_today, inputs=[ck, samp], outputs=[out_plot, out_note, out_df])
+
+            with gr.Tab("Evaluation (ΔRMSE)"):
+                scope = gr.Radio(choices=["merged", "dry", "wet"], value="merged", label="Select window")
+                tbl = gr.Dataframe(interactive=False)
+                scope.change(fn=ui_phase_table, inputs=scope, outputs=tbl)
+                gr.Markdown("> Note: scan optimal phase shift k* on 2023, then fix it on the corresponding 2024 windows; show RMSE before/after alignment and ΔRMSE.")
+    return demo
+
+if __name__ == "__main__":
+    # warm-up (load model and data to avoid first-click latency)
+    _load_service()
+    app = build_app()
+    app.launch(server_name="0.0.0.0", server_port=7860)
