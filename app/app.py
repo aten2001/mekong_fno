@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import gradio as gr
 from zoneinfo import ZoneInfo
 
-from src.runner import TenYearUnifiedRunner, doy_sin_cos_series  # 若没有暴露，复制 notebook 里的实现
+from src.runner import TenYearUnifiedRunner, doy_sin_cos_series
 from src.model_fno import SeasonalFNO1D
 
 from src.runner import doy_no_leap
