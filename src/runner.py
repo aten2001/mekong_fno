@@ -322,7 +322,6 @@ class TenYearUnifiedRunner:
             den = tf.sqrt(tf.reduce_sum(yt ** 2, axis=1) * tf.reduce_sum(yp ** 2, axis=1) + 1e-8)
             corr = num / den  # [B]
 
-            # 返回 [B]，与 sample_weight=[B] 完美匹配
             return mse_per_sample + alpha * (1.0 - corr)
 
         class AlphaScheduler(tf.keras.callbacks.Callback):
