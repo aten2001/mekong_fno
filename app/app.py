@@ -1,5 +1,5 @@
 # app/app.py
-import os, json, glob, time
+import os, json, glob, io, time
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -7,8 +7,10 @@ import matplotlib.pyplot as plt
 import gradio as gr
 from zoneinfo import ZoneInfo
 
-from src.runner import TenYearUnifiedRunner, doy_sin_cos_series
+from src.runner import TenYearUnifiedRunner, doy_sin_cos_series  # 若没有暴露，复制 notebook 里的实现
 from src.model_fno import SeasonalFNO1D
+
+from src.runner import doy_no_leap
 
 SEQ_LENGTH = 120
 PRED_LENGTH = 7
@@ -18,7 +20,7 @@ CSV_DIR = os.environ.get("CSV_DIR", ".")
 CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
 NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
 PHASE_JSON = os.path.join(ART_DIR, "phase_report.json")
-
+RESID_PATH = os.path.join(ART_DIR, "residual_sigma.json")  # day5: historical residual band
 
 def _find_ckpt(weights_dir=WEIGHTS_DIR):
     ckpt = tf.train.latest_checkpoint(weights_dir)
@@ -43,12 +45,12 @@ def _norm_inputs_like_train(X, st):
 
 def _build_window_Xn(runner, water_daily: pd.Series, date_anchor: pd.Timestamp):
     """
-    runner.predict_h_range’s window construction
-    and normalization (build only Xn and the next 7 dates)
+    runner.predict_h_range’s window construction and normalization
+     (build only Xn and the next 7 dates)
     """
     date_anchor = pd.to_datetime(date_anchor).normalize()
     L = int(SEQ_LENGTH)
-    # Collect L days backward from the end (skip Feb 29)
+    # collect L days backward from the end (skip Feb 29)
     days = []
     d = date_anchor
     while len(days) < L:
@@ -84,7 +86,7 @@ def _build_window_Xn(runner, water_daily: pd.Series, date_anchor: pd.Timestamp):
     Xn[:, :, 2] = (Xn[:, :, 2] - st['h_in_mean'])/ (st['h_in_std'] + 1e-8)
     Xn[:, :, 3] = (Xn[:, :, 3] - st['dh_in_mean'])/(st['dh_in_std'] + 1e-8)
 
-    # next 7 days (remove Feb 29; pad if a boundary is encountered)
+    # Next 7 dates (remove Feb 29; pad if boundary is encountered)
     fut_dates = pd.date_range(date_anchor + pd.Timedelta(days=1), periods=PRED_LENGTH, freq='D')
     fut_dates = fut_dates[~((fut_dates.month==2) & (fut_dates.day==29))]
     while len(fut_dates) < PRED_LENGTH:
@@ -100,14 +102,14 @@ def _predict_7_abs(runner, Xn, fut_dates, training=False):
     y_pred_n = runner.model(Xn, training=training).numpy()  # [1,7,1]
     st = runner.norm_stats
     y_pred_anom = (y_pred_n * st['h_std'] + st['h_mean'])[0, :, 0]  # [7]
-    # Add the 7th-day DOY to the entire sequence back
-    from src.runner import doy_no_leap
+
+    # add the 7th-day DOY to the entire sequence (consistent with evaluation)
     tgt_day = pd.to_datetime(fut_dates[-1]).normalize()
     tgt_doy = doy_no_leap(tgt_day)
     clim_add = np.full((PRED_LENGTH,), float(runner.clim[tgt_doy]), dtype=np.float32)
     return (y_pred_anom + clim_add).astype(np.float32)
 
-# ----------------- Runtime Singleton Cache (avoid repeated loading) -----------------
+# ----------------- run time Singleton Cache (avoid repeated loading) -----------------
 _APP_CACHE = dict()
 
 def _load_service():
@@ -127,71 +129,102 @@ def _load_service():
     model.load_weights(_find_ckpt())
     runner.model = model
 
-    # Daily series: water_daily
+    # daily series: water_daily
     df = pd.DataFrame(data, columns=['time_idx','x_pos','u','h','ts'])
     df['date'] = pd.to_datetime(df['ts']).dt.date
     water_daily = df.groupby('date')['h'].mean()  # pandas.Series: index=date -> value=h(m)
 
-    _APP_CACHE.update(dict(runner=runner, water_daily=water_daily, ready=True))
+    # day5: try to load historical residual band
+    resid_sigma = None
+    if os.path.exists(RESID_PATH):
+        resid_sigma = json.load(open(RESID_PATH, "r", encoding="utf-8"))
+
+    _APP_CACHE.update(dict(
+        runner=runner,
+        water_daily=water_daily,
+        resid_sigma=resid_sigma,  # residual band statistics
+        mc_cache={},  # MC Dropout results cache
+        ready=True
+    ))
     print(f"[app] loaded in {time.perf_counter()-t0:.2f}s, days={len(water_daily)}")
     return _APP_CACHE
 
 # ----------------- Tab 1: Today → 7 Days -----------------
-def ui_predict_today(show_uncertainty=False, mc_samples=30):
+def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (fast)", mc_samples=30):
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
+    resid_sigma = S.get("resid_sigma")
+    mc_cache = S.get("mc_cache", {})
 
-    # Choose the window end: prefer “today (UTC+07)”;
+    # Choose the window end: prefer “today (UTC+07)”
     # if data is missing, fall back to the last observed day
     today = _today_utc7_date()
     anchor = today if today in water_daily.index else max(water_daily.index)
     if len(water_daily) < SEQ_LENGTH:
         return None, f"Not enough data for a {SEQ_LENGTH}-day window (currently {len(water_daily)} days).", None
 
-    # Build Xn and the future dates
+    # build Xn and the future dates
     try:
         Xn, fut_dates = _build_window_Xn(runner, water_daily, pd.Timestamp(anchor))
     except Exception as e:
         return None, f"Failed to build input window: {e}", None
 
-    # Central (deterministic) prediction
+    # central (deterministic) prediction
     t0 = time.perf_counter()
-    y_abs = _predict_7_abs(runner, Xn, fut_dates, training=False)   # [7]
-    latency_ms = (time.perf_counter()-t0)*1000
+    y_abs = _predict_7_abs(runner, Xn, fut_dates, training=False)  # [7]
+    latency_ms = (time.perf_counter() - t0) * 1000
 
-    # Uncertainty (MC Dropout)
+    # default to historical residual band
+    # optional MC Dropout with caching
     lo = hi = None
+    band_note = ""
     if show_uncertainty:
-        N = int(mc_samples)
-        Ys = []
-        for _ in range(N):
-            Ys.append(_predict_7_abs(runner, Xn, fut_dates, training=True))
-        Ys = np.stack(Ys, axis=0)  # [N,7]
-        lo, hi = np.percentile(Ys, [10, 90], axis=0)  # 10–90% interval
+        if src_choice.startswith("Historical residuals"):
+            if resid_sigma and "by_horizon" in resid_sigma:
+                sigma = np.array(resid_sigma["by_horizon"], dtype=np.float32)  # [7]
+                lo = y_abs - 1.96 * sigma
+                hi = y_abs + 1.96 * sigma
+                band_note = f"Historical residual band ±1.96σ (n={resid_sigma.get('n', '?')})"
+            else:
+                # 若没有 residual_sigma.json，回退到 MC
+                src_choice = "MC Dropout (slow)"
+                band_note = "residual_sigma.json not found; fell back to MC Dropout."
+
+        if src_choice.startswith("MC Dropout"):
+            key = (str(anchor), int(mc_samples))
+            if key in mc_cache:
+                lo, hi = mc_cache[key]
+                band_note = f"MC Dropout p10–90 (cache hit, N={mc_samples})"
+            else:
+                N = int(mc_samples)
+                Ys = [_predict_7_abs(runner, Xn, fut_dates, training=True) for _ in range(N)]
+                Ys = np.stack(Ys, axis=0)  # [N,7]
+                lo, hi = np.percentile(Ys, [10, 90], axis=0)
+                mc_cache[key] = (lo, hi)
+                band_note = f"MC Dropout p10–90（N={mc_samples}）"
 
     # plot
     fig = plt.figure(figsize=(9.5, 4.2))
     plt.plot(fut_dates, y_abs, label="FNO (mean)", linewidth=2)
     if lo is not None:
-        plt.fill_between(fut_dates, lo, hi, alpha=0.18, label="MC 10–90%")
-    plt.title("7-day absolute water level (UTC+07)")
+        plt.fill_between(fut_dates, lo, hi, alpha=0.18, label=band_note or "Uncertainty band")
+    plt.title("Next 7-day absolute water level (UTC+07)")
     plt.xlabel("Date"); plt.ylabel("Water Level (m)")
     plt.xticks(rotation=20); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
 
-    # table output
+    # output table
     df_out = pd.DataFrame({"date": pd.to_datetime(fut_dates).date, "h_pred": y_abs})
     if lo is not None:
         df_out["p10"] = lo; df_out["p90"] = hi
 
-    note = f"Window end: {anchor} ({'today' if anchor==today else 'last observed day'}); forward latency ≈ {latency_ms:.0f} ms"
+    note = "Next 7-day absolute water level (UTC+07)"
+    if band_note:
+        note += f"; Uncertainty: {band_note}"
     return fig, note, df_out
 
-# ----------------- Tab 2: ΔRMSE Table -----------------
+# ----------------- Tab2：ΔRMSE Table -----------------
 def _load_phase_json_or_fallback():
-    """
-    Prefer reading artifacts/phase_report.json;
-    if missing, show a notice or return an empty table
-    """
+    """Prefer reading artifacts/phase_report.json; if missing, return None"""
     if os.path.exists(PHASE_JSON):
         with open(PHASE_JSON, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -199,11 +232,10 @@ def _load_phase_json_or_fallback():
 
 def ui_phase_table(scope):
     """
-    scope: 'merged', 'dry', 'wet'.
-    Return a DataFrame showing RMSE before/after alignment and ΔRMSE
-    (based on 2024 test_applied)
+    scope: 'Merged', 'Dry', 'Wet'
+    Return a DataFrame showing RMSE before/after alignment and ΔRMSE (based on 2024 test_applied)
     """
-    mapping = {"merged":"all", "dry":"dry", "wet":"wet"}
+    mapping = {"Merged":"all", "Dry":"dry", "Wet":"wet"}
     key = mapping.get(scope, "all")
     rep = _load_phase_json_or_fallback()
     if rep is None:
@@ -222,29 +254,32 @@ def ui_phase_table(scope):
 # ----------------- Gradio UI -----------------
 def build_app():
     with gr.Blocks(title="Mekong FNO Demo", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("### Mekong Water Level Forecast (Stung Treng) — FNO\n- Tab1: **Forecast Today → 7 days** (optional uncertainty)\n- Tab2: **ΔRMSE alignment evaluation** (reads `artifacts/phase_report.json`)")
+        gr.Markdown("### Mekong Water Level Forecast (Stung Treng) — FNO\n- Tab1: **Forecast Today → +7 days** (optional uncertainty)\n- Tab2: **ΔRMSE alignment evaluation** (reads `artifacts/phase_report.json`)")
 
         with gr.Tabs():
-            with gr.Tab("Forecast (Today → 7 days)"):
+            with gr.Tab("Forecast (Today → +7 days)"):
                 with gr.Row():
                     btn = gr.Button("Predict Today (UTC+07)", variant="primary")
-                    ck = gr.Checkbox(value=False, label="Show uncertainty (MC Dropout)")
+                    ck = gr.Checkbox(value=False, label="Show uncertainty (Residuals/MC)")
+                    src = gr.Radio(choices=["Historical residuals (fast)", "MC Dropout (slow)"],
+                                   value="Historical residuals (fast)", label="Uncertainty source")
                     samp = gr.Slider(10, 100, value=30, step=5, label="MC samples", interactive=True)
                 out_plot = gr.Plot()
                 out_note = gr.Markdown()
                 out_df   = gr.Dataframe(headers=["date","h_pred","p10","p90"], interactive=False)
 
-                btn.click(fn=ui_predict_today, inputs=[ck, samp], outputs=[out_plot, out_note, out_df])
+                btn.click(fn=ui_predict_today, inputs=[ck, src, samp], outputs=[out_plot, out_note, out_df])
 
             with gr.Tab("Evaluation (ΔRMSE)"):
-                scope = gr.Radio(choices=["merged", "dry", "wet"], value="merged", label="Select window")
+                scope = gr.Radio(choices=["Merged", "Dry", "Wet"], value="Merged", label="Select window")
                 tbl = gr.Dataframe(interactive=False)
                 scope.change(fn=ui_phase_table, inputs=scope, outputs=tbl)
-                gr.Markdown("> Note: scan optimal phase shift k* on 2023, then fix it on the corresponding 2024 windows; show RMSE before/after alignment and ΔRMSE.")
+                gr.Markdown(
+                    "> Note: scan the optimal phase shift k* on 2023, then fix it on the corresponding 2024 windows. Shows RMSE before/after alignment and ΔRMSE.")
     return demo
 
 if __name__ == "__main__":
-    # warm-up (load model and data to avoid first-click latency)
+    # warm-up (reduce latency for load model and data for the first time)
     _load_service()
     app = build_app()
     app.launch(server_name="0.0.0.0", server_port=7860)
