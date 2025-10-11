@@ -201,7 +201,7 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
                 Ys = np.stack(Ys, axis=0)  # [N,7]
                 lo, hi = np.percentile(Ys, [10, 90], axis=0)
                 mc_cache[key] = (lo, hi)
-                band_note = f"MC Dropout p10–90（N={mc_samples}）"
+                band_note = f"MC Dropout p10–90 (N={mc_samples})"
 
     # plot
     fig = plt.figure(figsize=(9.5, 4.2))
