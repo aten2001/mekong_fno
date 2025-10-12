@@ -12,6 +12,9 @@ from src.model_fno import SeasonalFNO1D
 
 from src.runner import doy_no_leap
 
+# --- live daily means from MRC API ---
+from src.live_mrc import get_recent_daily_cached, merge_into_water_daily
+
 SEQ_LENGTH = 120
 PRED_LENGTH = 7
 ART_DIR = "artifacts"
@@ -21,6 +24,9 @@ CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
 NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
 PHASE_JSON = os.path.join(ART_DIR, "phase_report.json")
 RESID_PATH = os.path.join(ART_DIR, "residual_sigma.json")  # day5: historical residual band
+
+STATION_CODE = os.environ.get("STUNG_TRENG_CODE", "014501")
+LIVE_CACHE   = os.path.join(ART_DIR, "live_recent_daily.json")
 
 def _find_ckpt(weights_dir=WEIGHTS_DIR):
     ckpt = tf.train.latest_checkpoint(weights_dir)
@@ -133,6 +139,18 @@ def _load_service():
     df = pd.DataFrame(data, columns=['time_idx','x_pos','u','h','ts'])
     df['date'] = pd.to_datetime(df['ts']).dt.date
     water_daily = df.groupby('date')['h'].mean()  # pandas.Series: index=date -> value=h(m)
+
+    try:
+        live_daily = get_recent_daily_cached(
+            station_code=STATION_CODE,
+            cache_path=LIVE_CACHE,
+            ttl_seconds=900,  # 15 minutes cache
+        )
+        if live_daily is not None and not live_daily.empty:
+            water_daily = merge_into_water_daily(water_daily, live_daily)
+            print(f"[app] merged live daily: +{len(live_daily)} day(s)")
+    except Exception as e:
+        print("[app] live merge skipped:", e)
 
     # day5: try to load historical residual band
     resid_sigma = None
@@ -259,7 +277,7 @@ def build_app():
         with gr.Tabs():
             with gr.Tab("Forecast (Today → +7 days)"):
                 with gr.Row():
-                    btn = gr.Button("Predict Today (UTC+07)", variant="primary")
+                    btn = gr.Button("Forecast +7 Days (UTC+07)", variant="primary")
                     ck = gr.Checkbox(value=False, label="Show uncertainty (Residuals/MC)")
                     src = gr.Radio(choices=["Historical residuals (fast)", "MC Dropout (slow)"],
                                    value="Historical residuals (fast)", label="Uncertainty source")
