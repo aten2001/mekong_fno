@@ -1,8 +1,22 @@
-tensorflow-cpu==2.13.0
-numpy<=1.24.3
+# Core
+numpy==1.24.3
 pandas==2.0.3
 matplotlib==3.7.2
+requests>=2.31.0
+
+# TensorFlow by OS (CPU builds)
+tensorflow==2.13.0           ; sys_platform == "win32"
+tensorflow==2.13.0           ; sys_platform == "linux"
+tensorflow-macos==2.13.0     ; sys_platform == "darwin" and platform_machine == "arm64"
+# Optional GPU accel on Apple Silicon
+tensorflow-metal==1.1.0      ; sys_platform == "darwin" and platform_machine == "arm64"
+
+# UI (compatible with TF 2.13 stack)
 gradio==3.50.2
 fastapi<0.100
 pydantic<2
-typing-extensions==4.5.0
+
+# Misc compat
+typing-extensions>=4.5.0,<5
+protobuf>=3.20,<5
+tzdata==2024.1
