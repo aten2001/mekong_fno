@@ -24,6 +24,9 @@ CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
 NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
 PHASE_JSON = os.path.join(ART_DIR, "phase_report.json")
 RESID_PATH = os.path.join(ART_DIR, "residual_sigma.json")  # day5: historical residual band
+# --- risk thresholds shown on YTD backtest plot ---
+ALARM_LEVEL = 10.7   # Alarm level: 10.7 m
+FLOOD_LEVEL = 12.0   # Flood level: 12 m
 
 STATION_CODE = os.environ.get("STUNG_TRENG_CODE", "014501")
 LIVE_CACHE   = os.path.join(ART_DIR, "live_recent_daily.json")
@@ -115,6 +118,84 @@ def _predict_7_abs(runner, Xn, fut_dates, training=False):
     clim_add = np.full((PRED_LENGTH,), float(runner.clim[tgt_doy]), dtype=np.float32)
     return (y_pred_anom + clim_add).astype(np.float32)
 
+def _backtest_ytd_1day(runner, water_daily, start="2025-01-01", end=None):
+    """
+    1-day-ahead backtest from 2025-01-01 to today (or a specified end date)
+    For each target day T: build a 120-day window with anchor = T-1, forecast the next 7 days,
+    and compare day-1 with the observation.
+    Returns: df(date, h_true, h_pred, err), rmse
+    """
+    if end is None:
+        end = _today_utc7_date()
+    start = pd.to_datetime(start).date()
+    end   = pd.to_datetime(end).date()
+
+    dates = pd.date_range(start, end, freq="D").date
+    preds, trues, out_dates = [], [], []
+
+    for T in dates:
+        # skip Feb 29 (to be consistent with training/inference)
+        if T.month == 2 and T.day == 29:
+            continue
+        anchor = pd.Timestamp(T) - pd.Timedelta(days=1)
+
+        # skip if the anchor or target day is missing (requires a continuous daily series)
+        if anchor.date() not in water_daily.index or T not in water_daily.index:
+            continue
+
+        try:
+            Xn, fut_dates = _build_window_Xn(runner, water_daily, anchor)
+        except Exception:
+            continue
+
+        y_abs = _predict_7_abs(runner, Xn, fut_dates, training=False)  # [7]
+        pred1 = float(y_abs[0])  # 1-day ahead
+        true  = float(water_daily[T])
+
+        out_dates.append(pd.to_datetime(T))
+        preds.append(pred1)
+        trues.append(true)
+
+    df = pd.DataFrame({"date": out_dates, "h_true": trues, "h_pred": preds})
+    if len(df):
+        df["err"] = df["h_pred"] - df["h_true"]
+        rmse = float(np.sqrt(np.mean(df["err"]**2)))
+    else:
+        rmse = None
+    return df, rmse
+
+def ui_eval_ytd():
+    """
+    Gradio callback: plot the 2025 YTD ‘Observed vs Predicted’ (1-day ahead) and provide an RMSE summary.
+    Overlay threshold lines on the plot: Alarm 10.7 m, Flood 12 m.
+    """
+    S = _load_service()
+    runner, water_daily = S["runner"], S["water_daily"]
+
+    df, rmse = _backtest_ytd_1day(runner, water_daily, start="2025-01-01")
+    if df is None or len(df) == 0:
+        return None, "Not enough data to backtest 2025 YTD.", pd.DataFrame()
+
+    # plot
+    fig = plt.figure(figsize=(10.5, 4.0))
+    plt.plot(df["date"], df["h_true"], label="Observed", linewidth=1.8)
+    plt.plot(df["date"], df["h_pred"], label="FNO (1-day ahead)", linewidth=1.8)
+    # threshold lines
+    plt.axhline(ALARM_LEVEL, linestyle="--", linewidth=1, label=f"Alarm {ALARM_LEVEL:.1f} m")
+    plt.axhline(FLOOD_LEVEL, linestyle="--", linewidth=1, label=f"Flood {FLOOD_LEVEL:.1f} m")
+
+    plt.title("2025 YTD — Observed vs Predicted (1-day ahead)")
+    plt.xlabel("Date"); plt.ylabel("Water Level (m)")
+    plt.xticks(rotation=20); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+
+    note = (
+        f"Backtest window: 2025-01-01 → {df['date'].iloc[-1].date()} "
+        f"| N={len(df)} | RMSE={rmse:.3f} m "
+        f"| Alarm={ALARM_LEVEL:.1f} m, Flood={FLOOD_LEVEL:.1f} m"
+    )
+    # return the df for download/viewing (including err)
+    return fig, note, df[["date", "h_true", "h_pred", "err"]]
+
 # ----------------- run time Singleton Cache (avoid repeated loading) -----------------
 _APP_CACHE = dict()
 
@@ -204,7 +285,7 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
                 hi = y_abs + 1.96 * sigma
                 band_note = f"Historical residual band ±1.96σ (n={resid_sigma.get('n', '?')})"
             else:
-                # 若没有 residual_sigma.json，回退到 MC
+                # if residual_sigma.json is missing, fall back to MC
                 src_choice = "MC Dropout (slow)"
                 band_note = "residual_sigma.json not found; fell back to MC Dropout."
 
@@ -288,12 +369,26 @@ def build_app():
 
                 btn.click(fn=ui_predict_today, inputs=[ck, src, samp], outputs=[out_plot, out_note, out_df])
 
-            with gr.Tab("Evaluation (ΔRMSE)"):
+            with gr.Tab("Evaluation (2025 YTD & ΔRMSE)"):
+                # --- YTD backtest (1-day ahead) ---
+                with gr.Row():
+                    btn_bt = gr.Button("Run 2025 YTD backtest (1-day ahead)", variant="primary")
+                ytd_plot = gr.Plot()
+                ytd_note = gr.Markdown()
+                ytd_df = gr.Dataframe(interactive=False)
+                btn_bt.click(fn=ui_eval_ytd, inputs=None, outputs=[ytd_plot, ytd_note, ytd_df])
+
+                gr.Markdown("---")
+
+                # --- ΔRMSE table ---
                 scope = gr.Radio(choices=["Merged", "Dry", "Wet"], value="Merged", label="Select window")
                 tbl = gr.Dataframe(interactive=False)
                 scope.change(fn=ui_phase_table, inputs=scope, outputs=tbl)
                 gr.Markdown(
-                    "> Note: scan the optimal phase shift k* on 2023, then fix it on the corresponding 2024 windows. Shows RMSE before/after alignment and ΔRMSE.")
+                    "> Note: scan the optimal phase shift k* on 2023, then fix it on the corresponding 2024 windows. "
+                    "Shows RMSE before/after alignment and ΔRMSE."
+                )
+
     return demo
 
 if __name__ == "__main__":
