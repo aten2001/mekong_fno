@@ -13,7 +13,8 @@ from src.model_fno import SeasonalFNO1D
 from src.runner import doy_no_leap
 
 # --- live daily means from MRC API ---
-from src.live_mrc import get_recent_daily_cached, merge_into_water_daily
+from src.live_mrc import get_recent_daily_cached
+from src.backfill import BACKFILL_PATH, read_backfill, write_backfill, series_from_any
 
 SEQ_LENGTH = 120
 PRED_LENGTH = 7
@@ -27,6 +28,75 @@ RESID_PATH = os.path.join(ART_DIR, "residual_sigma.json")  # day5: historical re
 # --- risk thresholds shown on YTD backtest plot ---
 ALARM_LEVEL = 10.7   # Alarm level: 10.7 m
 FLOOD_LEVEL = 12.0   # Flood level: 12 m
+
+# === merge historical & live data into a continuous daily series (auto-fill “internal 1-day gaps”) ===
+from typing import Optional
+
+def _merge_hist_and_live_no_gaps(water_daily_hist: pd.Series,
+                                 live_daily: Optional[pd.Series],
+                                 fill_small_holes: bool = True) -> pd.Series:
+    """
+    Return a continuous daily water_daily series (index = Python date, value = h)
+    - use live data to overwrite/extend the tail of the historical series
+    - rebuild a complete daily calendar index
+    - interpolate (or forward-fill) internal gaps of ≤1 day
+    """
+    def _to_dt_index(s: Optional[pd.Series]) -> pd.Series:
+        if s is None or len(s) == 0:
+            return pd.Series(dtype=float)
+        idx = pd.to_datetime(list(s.index))
+        return pd.Series(s.values, index=idx, dtype=float).sort_index()
+
+    wd = _to_dt_index(water_daily_hist)
+    if live_daily is not None and len(live_daily) > 0:
+        live = _to_dt_index(live_daily)
+        # for overlapping days, prefer live values (overwrite same-day entries)
+        wd = pd.concat([wd, live]).groupby(level=0).last().sort_index()
+
+    if len(wd) == 0:
+        return pd.Series(dtype=float)
+
+    # reindex to a full daily calendar (from earliest to latest)
+    full = pd.date_range(wd.index.min(), wd.index.max(), freq="D")
+    wd = wd.reindex(full)
+
+    # fill with linear interpolation only internal small gaps;
+    # leave endpoints untouched.
+    if fill_small_holes:
+        wd = wd.interpolate(limit=1, limit_area="inside")
+
+    # convert the index back to Python date to stay consistent with existing code
+    return pd.Series(wd.values, index=wd.index.date)
+
+# === determine continuity using only “valid (non-NaN) values” and return the last day of the contiguous block as the anchor ===
+def _latest_contiguous_anchor(water_daily: pd.Series, need: int = 120) -> pd.Timestamp.date:
+    """
+    Scan backward from the last day in water_daily to find the most recent block
+    with “≥ need days” of continuity, and return its last day as the anchor;
+    Count only dates with non-NaN values toward continuity;
+    """
+    if len(water_daily) < need:
+        raise ValueError(f"Not enough data for a {need}-day window (currently {len(water_daily)} days).")
+
+    # collect only dates with non-NaN values
+    valid_dates = {d for d, v in water_daily.items() if pd.notna(v)}
+
+    # use Timestamp to step back day by day conveniently
+    idx = pd.to_datetime(list(water_daily.index))
+    d = idx.max().normalize()
+
+    run = 0
+    while d.date() >= idx.min().date():
+        if d.date() in valid_dates:
+            run += 1
+            if run >= need:
+                # return the “last day of the contiguous block” as the anchor (not the start)
+                return (d + pd.Timedelta(days=need - 1)).date()
+        else:
+            run = 0
+        d -= pd.Timedelta(days=1)
+
+    raise ValueError(f"Not enough contiguous data for {need} days.")
 
 STATION_CODE = os.environ.get("STUNG_TRENG_CODE", "014501")
 LIVE_CACHE   = os.path.join(ART_DIR, "live_recent_daily.json")
@@ -79,8 +149,11 @@ def _build_window_Xn(runner, water_daily: pd.Series, date_anchor: pd.Timestamp):
     h_vals = []
     for dt in days:
         key = getattr(dt, "date", lambda: dt)()
-        if key not in water_daily.index:
-            raise ValueError(f"Missing water level for {dt.date()}, need continuous daily series.")
+        # if a date is missing from the index or its value is NaN, treat it as missing
+        if (key not in water_daily.index) or pd.isna(water_daily[key]):
+            raise ValueError(
+                f"Missing water level for {dt.date()} (NaN or absent), need continuous daily series with valid values."
+            )
         h_vals.append(float(water_daily[key]))
     h_vals = np.asarray(h_vals, np.float32)
     dh1 = np.concatenate([[0.0], np.diff(h_vals)]).astype(np.float32)
@@ -139,10 +212,11 @@ def _backtest_ytd_1day(runner, water_daily, start="2025-01-01", end=None):
             continue
         anchor = pd.Timestamp(T) - pd.Timedelta(days=1)
 
-        # skip if the anchor or target day is missing (requires a continuous daily series)
-        if anchor.date() not in water_daily.index or T not in water_daily.index:
+        # skip if anchor/target missing or NaN
+        if (anchor.date() not in water_daily.index) or (T not in water_daily.index):
             continue
-
+        if pd.isna(water_daily[anchor.date()]) or pd.isna(water_daily[T]):
+            continue
         try:
             Xn, fut_dates = _build_window_Xn(runner, water_daily, anchor)
         except Exception:
@@ -219,21 +293,49 @@ def _load_service():
     # daily series: water_daily
     df = pd.DataFrame(data, columns=['time_idx','x_pos','u','h','ts'])
     df['date'] = pd.to_datetime(df['ts']).dt.date
-    water_daily = df.groupby('date')['h'].mean()  # pandas.Series: index=date -> value=h(m)
+    water_daily_hist = df.groupby('date')['h'].mean()  # pandas.Series: index=date -> value=h(m)
 
+    # read historical backfill (Parquet)
+    backfill = read_backfill(BACKFILL_PATH)
+
+    # fetch live daily means (Series: index = Python date → value = float)
+    live_daily = None
     try:
         live_daily = get_recent_daily_cached(
             station_code=STATION_CODE,
             cache_path=LIVE_CACHE,
-            ttl_seconds=900,  # 15 minutes cache
+            ttl_seconds=900,
         )
-        if live_daily is not None and not live_daily.empty:
-            water_daily = merge_into_water_daily(water_daily, live_daily)
-            print(f"[app] merged live daily: +{len(live_daily)} day(s)")
     except Exception as e:
-        print("[app] live merge skipped:", e)
+        print("[app] live fetch skipped:", e)
 
-    # day5: try to load historical residual band
+    # normalize to a Series (also handle cases where upstream returns a DataFrame)
+    live_daily = series_from_any(live_daily)
+    if backfill is not None:
+        backfill = series_from_any(backfill)
+
+    # three-layer merge: CSV ⊕ backfill ⊕ live (later layers overwrite earlier ones)
+    wd = _merge_hist_and_live_no_gaps(water_daily_hist, backfill, fill_small_holes=True)
+    water_daily = _merge_hist_and_live_no_gaps(wd, live_daily, fill_small_holes=True)
+
+    # treat live data for “today-1 and earlier” as stable and write it back to backfill
+    try:
+        if live_daily is not None and len(live_daily) > 0:
+            cutoff = (pd.Timestamp(_today_utc7_date()) - pd.Timedelta(days=1))
+            stable_idx = [d for d, v in live_daily.items() if pd.notna(v) and pd.Timestamp(d) <= cutoff]
+            if len(stable_idx) > 0:
+                stable = pd.Series([live_daily[d] for d in stable_idx], index=stable_idx, dtype=float).sort_index()
+                if backfill is None or len(backfill) == 0:
+                    new_backfill = stable
+                else:
+                    new_backfill = pd.concat([backfill, stable]).groupby(level=0).last().sort_index()
+                write_backfill(new_backfill, BACKFILL_PATH)
+    except Exception as e:
+        print("[app] backfill write skipped:", e)
+
+    print(f"[app] daily merged: days={len(water_daily)}, range={min(water_daily.index)}→{max(water_daily.index)}")
+
+    # try to load historical residual band
     resid_sigma = None
     if os.path.exists(RESID_PATH):
         resid_sigma = json.load(open(RESID_PATH, "r", encoding="utf-8"))
@@ -245,6 +347,14 @@ def _load_service():
         mc_cache={},  # MC Dropout results cache
         ready=True
     ))
+
+    # debug
+    full = pd.date_range(min(water_daily.index), max(water_daily.index), freq="D")
+    missing = set(full.date) - set(water_daily.index)
+    tail_missing = sorted([d for d in missing if d >= (max(water_daily.index) - pd.Timedelta(days=14)).date()])
+    if tail_missing:
+        print(f"[app][warn] recent missing days auto-handled: {tail_missing}")
+
     print(f"[app] loaded in {time.perf_counter()-t0:.2f}s, days={len(water_daily)}")
     return _APP_CACHE
 
@@ -255,12 +365,13 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
     resid_sigma = S.get("resid_sigma")
     mc_cache = S.get("mc_cache", {})
 
-    # Choose the window end: prefer “today (UTC+07)”
-    # if data is missing, fall back to the last observed day
-    today = _today_utc7_date()
-    anchor = today if today in water_daily.index else max(water_daily.index)
+    # choose the last day of the most recent block with “≥ SEQ_LENGTH days” of continuity as the anchor (avoid tail-end gaps)
     if len(water_daily) < SEQ_LENGTH:
         return None, f"Not enough data for a {SEQ_LENGTH}-day window (currently {len(water_daily)} days).", None
+    try:
+        anchor = _latest_contiguous_anchor(water_daily, SEQ_LENGTH)
+    except Exception as e:
+        return None, f"Not enough contiguous data: {e}", None
 
     # build Xn and the future dates
     try:
