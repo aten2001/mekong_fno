@@ -3,8 +3,15 @@ import os, json, glob, io, time
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+
+os.environ.setdefault("MPLBACKEND", "Agg")
+import matplotlib
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
+plt.ioff()  # turn off interactive mode to avoid accidentally launching a GUI
+
 import gradio as gr
+
 from zoneinfo import ZoneInfo
 
 from src.runner import TenYearUnifiedRunner, doy_sin_cos_series
@@ -21,10 +28,14 @@ PRED_LENGTH = 7
 ART_DIR = "artifacts"
 WEIGHTS_DIR = "weights"
 CSV_DIR = os.environ.get("CSV_DIR", "data")
+
+# 3S at Sekong bridge (014500) CSV
+W3S_CSV = os.path.join(CSV_DIR, "Water Level.TelemetryKH_014500_3S at Sekong bridge.csv")
+
 CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
 NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
 PHASE_JSON = os.path.join(ART_DIR, "phase_report.json")
-RESID_PATH = os.path.join(ART_DIR, "residual_sigma.json")  # day5: historical residual band
+RESID_PATH = os.path.join(ART_DIR, "residual_sigma.json")  # historical residual band
 # --- risk thresholds shown on YTD backtest plot ---
 ALARM_LEVEL = 10.7   # Alarm level: 10.7 m
 FLOOD_LEVEL = 12.0   # Flood level: 12 m
@@ -67,6 +78,184 @@ def _merge_hist_and_live_no_gaps(water_daily_hist: pd.Series,
 
     # convert the index back to Python date to stay consistent with existing code
     return pd.Series(wd.values, index=wd.index.date)
+
+#  read the upstream-station CSV → aggregate by local (UTC+7) calendar days
+#  into a daily-mean Series (index = Python date → float)
+def _load_upstream_daily_csv(path: str):
+    if not os.path.exists(path):
+        print(f"[3S] file not found: {path}")
+        return None
+
+    df = pd.read_csv(path)
+    cols = {c.lower(): c for c in df.columns}
+
+    # column matching
+    for k in ["timestamp (utc+07:00)", "timestamp", "ts", "datetime", "date", "time"]:
+        if k in cols:
+            tcol = cols[k]; break
+    else:
+        tcol = df.columns[0]
+
+    for k in ["value", "h", "w", "water_level", "level"]:
+        if k in cols:
+            vcol = cols[k]; break
+    else:
+        num_cols = df.select_dtypes(include="number").columns
+        if len(num_cols) == 0:
+            print("[3S] no numeric column found")
+            return None
+        vcol = num_cols[0]
+
+    raw = df[tcol].astype(str)
+
+    # check whether timestamps include a timezone marker
+    has_tz_token = raw.str.contains(r'Z|[+-]\d{2}:\d{2}$', regex=True, na=False).any()
+    if has_tz_token:
+        ts = pd.to_datetime(raw, errors="coerce", utc=True).dt.tz_convert("Asia/Bangkok")
+    else:
+        ts = pd.to_datetime(raw, errors="coerce")
+        ts = ts.dt.tz_localize("Asia/Bangkok")  # already in local time
+
+    df = df.loc[ts.notna()].copy()
+    df["_ts_local"] = ts.dropna()
+    # aggregate by local calendar days
+    df["_date_local"] = df["_ts_local"].dt.date
+    s = df.groupby("_date_local")[vcol].mean().astype(float)
+
+    # use python date as the index
+    s.index = pd.Index(s.index, dtype="object")
+    s = s.sort_index()
+
+    print(f"[3S] daily series ready: len={len(s)}, range={min(s.index) if len(s) else None}→{max(s.index) if len(s) else None}")
+
+    # ---- interpolation across gaps up to 1 day to avoid breaks caused by small gaps ----
+    if len(s):
+        full = pd.date_range(min(s.index), max(s.index), freq="D").date
+        s = s.reindex(full)  # generate the complete daily calendar
+        s = s.interpolate(limit=1, limit_area="inside")  # fill at most 1 day for internal gaps
+        s = s.astype(float)
+
+    return s
+
+# fit FNO residuals using only the wet season (default Jun–Oct)
+# features = [3S water level, 3S first difference], with lag k (0..3)
+def _fit_3s_residual_model(
+    df_backtest: pd.DataFrame,
+    w3s_daily: pd.Series,
+    k_grid=(0, 1, 2, 3),
+    wet_months=(6, 7, 8, 9, 10),
+):
+    df = df_backtest.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df["err"] = df["h_true"] - df["h_pred"]
+
+    # keep only wet-season samples
+    df = df[df["date"].map(lambda d: d.month in set(wet_months))].copy()
+
+    if df.empty or w3s_daily is None or len(w3s_daily) == 0:
+        return None
+
+    w3s_lvl = w3s_daily
+    w3s_d1  = w3s_daily.diff()
+
+    best = None
+    for k in k_grid:
+        X_list, y_list = [], []
+        for d, e in zip(df["date"], df["err"]):
+            lag = d - pd.Timedelta(days=k)
+            if (lag in w3s_lvl.index) and (lag in w3s_d1.index):
+                x1 = w3s_lvl.get(lag)
+                x2 = w3s_d1.get(lag)
+                if pd.notna(e) and pd.notna(x1) and pd.notna(x2):
+                    X_list.append([float(x1), float(x2)])
+                    y_list.append(float(e))
+        if len(X_list) < 40:
+            continue
+
+        X = np.asarray(X_list, np.float64)   # [N,2] -> [level, diff]
+        y = np.asarray(y_list, np.float64)   # [N]
+
+        # standardization + bias column
+        mu = X.mean(axis=0); sd = X.std(axis=0) + 1e-8
+        Xn = (X - mu) / sd
+        Xd = np.c_[np.ones(len(Xn)), Xn]     # [1, z1, z2]
+
+        # ridge regression with small L2
+        lam = 1e-3
+        A = Xd.T @ Xd + lam * np.eye(Xd.shape[1])
+        coef = np.linalg.solve(A, Xd.T @ y)   # [a, b1, b2]
+
+        yhat = Xd @ coef
+        rmse_resid = float(np.sqrt(np.mean((y - yhat) ** 2)))
+
+        cand = dict(
+            a=float(coef[0]),
+            b1=float(coef[1]),  # coefficient for the standardized level
+            b2=float(coef[2]),  # coefficient for the standardized difference
+            mu=mu.tolist(),
+            sd=sd.tolist(),
+            k=int(k),
+            n=len(y),
+            rmse_resid=rmse_resid,
+            months=list(wet_months),
+        )
+        if (best is None) or (rmse_resid < best["rmse_resid"]):
+            best = cand
+
+    if best:
+        print(f"[3S-fit] k={best['k']}, n={best['n']}, rmse_resid={best['rmse_resid']:.4f}, "
+              f"coef a={best['a']:.4f}, b1={best['b1']:.4f}, b2={best['b2']:.4f}")
+    else:
+        print("[3S-fit] not enough samples to fit")
+    return best
+
+# apply 3S station correction: y_corr = h_pred + (a + b1*z1 + b2*z2)，where z* are [level, diff] after standardized
+def _apply_3s_correction(df_backtest: pd.DataFrame, w3s_daily: pd.Series, params: dict):
+    if not params:
+        return np.full(len(df_backtest), np.nan), np.full(len(df_backtest), np.nan)
+
+    a  = float(params["a"])
+    b1 = float(params["b1"]); b2 = float(params["b2"])
+    mu = np.asarray(params["mu"], dtype=np.float64)   # [2] for [level, diff]
+    sd = np.asarray(params["sd"], dtype=np.float64)   # [2]
+    k  = int(params["k"])
+    wet_months = set(params.get("months", [6,7,8,9,10]))
+
+    # align to the date index lagged by k days
+    # allowing interpolation over gaps up to 1 day
+    dates = pd.to_datetime(df_backtest["date"]).dt.date
+    lag_dates = [d - pd.Timedelta(days=k) for d in dates]
+    s_lvl = w3s_daily.reindex(lag_dates)
+    s_lvl = s_lvl.interpolate(limit=1, limit_area="inside").astype(float)
+
+    # take the first difference and set the first NaN to 0
+    s_d1 = s_lvl.diff()
+    if len(s_d1) > 0:
+        first_valid = np.where(~pd.isna(s_d1))[0]
+        if len(first_valid):
+            s_d1.iloc[first_valid[0]] = 0.0
+
+    y_corr = []; deltas = []
+    for d, hp, x1, x2 in zip(dates, df_backtest["h_pred"], s_lvl.values, s_d1.values):
+        if pd.isna(hp):
+            y_corr.append(np.nan); deltas.append(np.nan); continue
+
+        # for dry seaon do not apply correction
+        if d.month not in wet_months:
+            y_corr.append(float(hp)); deltas.append(0.0); continue
+
+        # for wet season apply correction only when both 3S features are valid
+        if pd.isna(x1) or pd.isna(x2):
+            delta = 0.0
+        else:
+            z = (np.array([float(x1), float(x2)]) - mu) / (sd + 1e-8)
+            delta = float(a + b1 * z[0] + b2 * z[1])
+
+        y_corr.append(float(hp + delta))
+        deltas.append(delta)
+
+    return np.array(y_corr, np.float32), np.array(deltas, np.float32)
+
 
 # === determine continuity using only “valid (non-NaN) values” and return the last day of the contiguous block as the anchor ===
 def _latest_contiguous_anchor(water_daily: pd.Series, need: int = 120) -> pd.Timestamp.date:
@@ -242,33 +431,103 @@ def ui_eval_ytd():
     """
     Gradio callback: plot the 2025 YTD ‘Observed vs Predicted’ (1-day ahead) and provide an RMSE summary.
     Overlay threshold lines on the plot: Alarm 10.7 m, Flood 12 m.
+    Plot the “FNO + 3S assist” curve (effective only on dates where 3S data exist).
     """
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
+    w3s_daily = S.get("w3s_daily")
 
     df, rmse = _backtest_ytd_1day(runner, water_daily, start="2025-01-01")
     if df is None or len(df) == 0:
         return None, "Not enough data to backtest 2025 YTD.", pd.DataFrame()
 
+    # fit + apply (only on dates with 3S station data)
+    y_corr = None
+    rmse_corr = None
+    note_extra = ""
+    if w3s_daily is not None and len(w3s_daily) > 0:
+        params = _fit_3s_residual_model(df, w3s_daily, k_grid=(0, 1, 2, 3))
+        if params:
+            y_corr, deltas = _apply_3s_correction(df, w3s_daily, params)
+            mask = ~np.isnan(y_corr) & ~np.isnan(df["h_true"].values)
+            if mask.sum() >= 30:
+                rmse_corr = float(np.sqrt(np.mean((y_corr[mask] - df["h_true"].values[mask]) ** 2)))
+                note_extra = (
+                    f" | 3S assist: k={params['k']}, N={int(mask.sum())}, "
+                    f"RMSE_adj={rmse_corr:.3f} m (vs {rmse:.3f})"
+                )
+            # put it back into the table for export/viewing
+            df["h_pred_3S"] = y_corr
+            df["delta_3S"] = deltas
+
+            # ===== Wet-season (Jun–Oct) RMSE alone + high-water days + count of days with Δ≠0 =====
+            df["month"] = pd.to_datetime(df["date"]).dt.month
+            wet_mask = df["month"].isin([6, 7, 8, 9, 10])
+
+            if y_corr is not None and wet_mask.any():
+                # wet-season RMSE before vs after correction
+                rmse_wet_raw = float(np.sqrt(np.mean((df.loc[wet_mask, "h_pred"] - df.loc[wet_mask, "h_true"]) ** 2)))
+                rmse_wet_adj = float(
+                    np.sqrt(np.mean((df.loc[wet_mask, "h_pred_3S"] - df.loc[wet_mask, "h_true"]) ** 2)))
+                wet_gain_pct = 100.0 * (rmse_wet_raw - rmse_wet_adj) / (rmse_wet_raw + 1e-12)
+
+                # high-water days (observed ≥ 8 m)
+                high_mask = (df["h_true"] >= 8.0)
+                if high_mask.any():
+                    rmse_hi_raw = float(
+                        np.sqrt(np.mean((df.loc[high_mask, "h_pred"] - df.loc[high_mask, "h_true"]) ** 2)))
+                    rmse_hi_adj = float(
+                        np.sqrt(np.mean((df.loc[high_mask, "h_pred_3S"] - df.loc[high_mask, "h_true"]) ** 2)))
+                    hi_gain_pct = 100.0 * (rmse_hi_raw - rmse_hi_adj) / (rmse_hi_raw + 1e-12)
+                else:
+                    rmse_hi_raw = rmse_hi_adj = hi_gain_pct = None
+
+                # count the number of days where a correction actually occurred (Δ ≠ 0)
+                changed = np.isfinite(df["delta_3S"].values) & (np.abs(df["delta_3S"].values) > 1e-6)
+                n_changed = int(changed.sum())
+
+                # append the metrics to the annotation
+                note_extra += (
+                        f" | Wet RMSE={rmse_wet_adj:.3f} m (vs {rmse_wet_raw:.3f}, {wet_gain_pct:.1f}%↓)"
+                        f" | Δ!=0 days={n_changed}"
+                        + (f" | High(≥8m) RMSE={rmse_hi_adj:.3f} (vs {rmse_hi_raw:.3f}, {hi_gain_pct:.1f}%↓)"
+                           if rmse_hi_raw is not None else "")
+                )
+
     # plot
     fig = plt.figure(figsize=(10.5, 4.0))
     plt.plot(df["date"], df["h_true"], label="Observed", linewidth=1.8)
     plt.plot(df["date"], df["h_pred"], label="FNO (1-day ahead)", linewidth=1.8)
-    # threshold lines
+    if y_corr is not None:
+        plt.plot(df["date"], y_corr, label="FNO + 3S assist", linewidth=1.8)
     plt.axhline(ALARM_LEVEL, linestyle="--", linewidth=1, label=f"Alarm {ALARM_LEVEL:.1f} m")
     plt.axhline(FLOOD_LEVEL, linestyle="--", linewidth=1, label=f"Flood {FLOOD_LEVEL:.1f} m")
-
     plt.title("2025 YTD — Observed vs Predicted (1-day ahead)")
-    plt.xlabel("Date"); plt.ylabel("Water Level (m)")
-    plt.xticks(rotation=20); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+    plt.xlabel("Date")
+    plt.ylabel("Water Level (m)")
+    plt.xticks(rotation=20)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
 
     note = (
         f"Backtest window: 2025-01-01 → {df['date'].iloc[-1].date()} "
         f"| N={len(df)} | RMSE={rmse:.3f} m "
         f"| Alarm={ALARM_LEVEL:.1f} m, Flood={FLOOD_LEVEL:.1f} m"
+        f"{note_extra}"
     )
-    # return the df for download/viewing (including err)
-    return fig, note, df[["date", "h_true", "h_pred", "err"]]
+    cols = ["date", "h_true", "h_pred"]
+    if "h_pred_3S" in df.columns:
+        # ===== include flags for wet season and whether a correction occurred when exporting =====
+        if "month" not in df.columns:
+            df["month"] = pd.to_datetime(df["date"]).dt.month
+        df["wet"] = df["month"].isin([6, 7, 8, 9, 10])
+        df["changed"] = np.where(np.isfinite(df.get("delta_3S", np.nan)) & (np.abs(df.get("delta_3S", 0.0)) > 1e-6),
+                                 True, False)
+        cols += ["h_pred_3S", "delta_3S", "wet", "changed"]
+
+    return fig, note, df[cols]
+
 
 # ----------------- run time Singleton Cache (avoid repeated loading) -----------------
 _APP_CACHE = dict()
@@ -335,6 +594,20 @@ def _load_service():
 
     print(f"[app] daily merged: days={len(water_daily)}, range={min(water_daily.index)}→{max(water_daily.index)}")
 
+    w3s_daily = _load_upstream_daily_csv(W3S_CSV)
+    if w3s_daily is not None and len(w3s_daily) > 0:
+        # Keep only the valid range
+        lo = pd.to_datetime("2024-04-06").date()
+        hi = pd.to_datetime("2025-09-21").date()
+        w3s_daily = w3s_daily.loc[lo:hi]
+
+    # debug
+    print(f"[3S] path={W3S_CSV} exists={os.path.exists(W3S_CSV)}")
+    if w3s_daily is None or len(w3s_daily) == 0:
+        print("[3S] empty after load/crop")
+    else:
+        print(f"[3S] len={len(w3s_daily)}, range={min(w3s_daily.index)}→{max(w3s_daily.index)}")
+
     # try to load historical residual band
     resid_sigma = None
     if os.path.exists(RESID_PATH):
@@ -345,6 +618,7 @@ def _load_service():
         water_daily=water_daily,
         resid_sigma=resid_sigma,  # residual band statistics
         mc_cache={},  # MC Dropout results cache
+        w3s_daily=w3s_daily,
         ready=True
     ))
 
@@ -461,6 +735,79 @@ def ui_phase_table(scope):
     }])
     return df
 
+def ui_compare_fno_vs_3s_window():
+    """
+    Compare FNO vs FNO+3S assist on dates where 3S data are available (with lag k).
+    Returns a single-row DataFrame with RMSE/MAE for both methods within that window.
+    """
+    S = _load_service()
+    runner, water_daily = S["runner"], S["water_daily"]
+    w3s_daily = S.get("w3s_daily")
+
+    # 先用现有回测拿到 2025 YTD 的基准 df（含 h_true/h_pred）
+    df, rmse = _backtest_ytd_1day(runner, water_daily, start="2025-01-01")
+    if df is None or len(df) == 0:
+        return pd.DataFrame({"message": ["Not enough data to backtest 2025 YTD."]})
+
+    # 如果没有 3S，直接返回提示
+    if w3s_daily is None or len(w3s_daily) == 0:
+        return pd.DataFrame({"message": ["3S daily series (014500) is empty."]})
+
+    # 拟合 3S 残差修正参数（与你在图上用的是同一套）
+    params = _fit_3s_residual_model(df, w3s_daily, k_grid=(0, 1, 2, 3))
+    if not params:
+        return pd.DataFrame({"message": ["Not enough samples to fit 3S assist parameters."]})
+
+    # 应用校正，得到 y_corr（FNO+3S）
+    y_corr, _ = _apply_3s_correction(df, w3s_daily, params)
+
+    # —— 关键：只在“3S 可用（考虑滞后 k）”的日期上做比较 ——
+    k = int(params["k"])
+    dates = pd.to_datetime(df["date"]).dt.date.values
+    lag_dates = np.array([d - pd.Timedelta(days=k) for d in dates], dtype="object")
+
+    # 3S 可用：在 w3s_daily 里存在且非 NaN
+    has_3s = np.array([(d in w3s_daily.index) and pd.notna(w3s_daily.get(d))
+                       for d in lag_dates], dtype=bool)
+
+    # 还要求 h_true/h_pred/y_corr 都是有效值
+    h_true = df["h_true"].values.astype(float)
+    h_pred = df["h_pred"].values.astype(float)
+    mask = has_3s & np.isfinite(h_true) & np.isfinite(h_pred) & np.isfinite(y_corr)
+
+    if mask.sum() == 0:
+        return pd.DataFrame({"message": ["No overlapping dates where 3S (with lag k) is available."]})
+
+    # 计算 RMSE / MAE：FNO vs FNO+3S，仅在 mask 窗口内
+    idx = np.where(mask)[0]
+    d_sub = dates[idx]
+    start_d = d_sub.min(); end_d = d_sub.max(); N = int(len(idx))
+
+    h_t = h_true[idx]
+    y_fno = h_pred[idx]
+    y_3s  = y_corr[idx]
+
+    rmse_fno = float(np.sqrt(np.mean((y_fno - h_t) ** 2)))
+    rmse_3s  = float(np.sqrt(np.mean((y_3s  - h_t) ** 2)))
+    mae_fno  = float(np.mean(np.abs(y_fno - h_t)))
+    mae_3s   = float(np.mean(np.abs(y_3s  - h_t)))
+
+    out = pd.DataFrame([{
+        "Window":         "3S-available (with lag k)",
+        "k (days)":       k,
+        "N":              N,
+        "From":           str(start_d),
+        "To":             str(end_d),
+        "RMSE (FNO)":     round(rmse_fno, 3),
+        "RMSE (FNO+3S)":  round(rmse_3s,  3),
+        "ΔRMSE":          round(rmse_3s - rmse_fno, 3),
+        "MAE (FNO)":      round(mae_fno,  3),
+        "MAE (FNO+3S)":   round(mae_3s,   3),
+        "ΔMAE":           round(mae_3s - mae_fno, 3),
+    }])
+
+    return out
+
 # ----------------- Gradio UI -----------------
 def build_app():
     with gr.Blocks(title="Mekong FNO Demo", theme=gr.themes.Soft()) as demo:
@@ -487,7 +834,19 @@ def build_app():
                 ytd_plot = gr.Plot()
                 ytd_note = gr.Markdown()
                 ytd_df = gr.Dataframe(interactive=False)
-                btn_bt.click(fn=ui_eval_ytd, inputs=None, outputs=[ytd_plot, ytd_note, ytd_df])
+                # backtest output
+                bt_evt = btn_bt.click(fn=ui_eval_ytd, inputs=None, outputs=[ytd_plot, ytd_note, ytd_df])
+
+                # FNO vs FNO+3S comparison within the 3S-available window
+                gr.Markdown("### FNO vs FNO + 3S (Only where 3S is available)")
+                with gr.Row():
+                    btn_cmp = gr.Button("Compare on 3S-available dates (RMSE & MAE)", variant="secondary")
+                cmp_tbl = gr.Dataframe(interactive=False)
+
+                # manual refresh
+                btn_cmp.click(fn=ui_compare_fno_vs_3s_window, inputs=None, outputs=cmp_tbl)
+                # automatically refresh once after the backtest completes
+                bt_evt.then(fn=ui_compare_fno_vs_3s_window, inputs=None, outputs=cmp_tbl)
 
                 gr.Markdown("---")
 
@@ -499,7 +858,6 @@ def build_app():
                     "> Note: scan the optimal phase shift k* on 2023, then fix it on the corresponding 2024 windows. "
                     "Shows RMSE before/after alignment and ΔRMSE."
                 )
-
     return demo
 
 if __name__ == "__main__":
