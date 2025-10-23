@@ -32,6 +32,11 @@ CSV_DIR = os.environ.get("CSV_DIR", "data")
 # 3S at Sekong bridge (014500) CSV
 W3S_CSV = os.path.join(CSV_DIR, "Water Level.TelemetryKH_014500_3S at Sekong bridge.csv")
 
+# --- NEW: Pakse (013901) paths & live cache ---
+PAKSE_CSV = os.path.join(CSV_DIR, "Water Level.ManualLA_013901_Pakse.csv")
+PAKSE_CODE = os.environ.get("PAKSE_CODE", "013901")
+LIVE_CACHE_PAKSE = os.path.join(ART_DIR, "live_recent_pakse.json")
+
 CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
 NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
 PHASE_JSON = os.path.join(ART_DIR, "phase_report.json")
@@ -436,6 +441,7 @@ def ui_eval_ytd():
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
     w3s_daily = S.get("w3s_daily")
+    pakse_daily = S.get("pakse_daily")   # NEW
 
     df, rmse = _backtest_ytd_1day(runner, water_daily, start="2025-01-01")
     if df is None or len(df) == 0:
@@ -445,6 +451,7 @@ def ui_eval_ytd():
     y_corr = None
     rmse_corr = None
     note_extra = ""
+
     if w3s_daily is not None and len(w3s_daily) > 0:
         params = _fit_3s_residual_model(df, w3s_daily, k_grid=(0, 1, 2, 3))
         if params:
@@ -494,10 +501,29 @@ def ui_eval_ytd():
                            if rmse_hi_raw is not None else "")
                 )
 
+    # === NEW: Pakse (013901) assist: fit + apply ===
+    y_corr_pk = None
+    if pakse_daily is not None and len(pakse_daily) > 0:
+        params_pk = _fit_3s_residual_model(df, pakse_daily, k_grid=(0, 1, 2, 3))
+        if params_pk:
+            y_corr_pk, deltas_pk = _apply_3s_correction(df, pakse_daily, params_pk)
+            mask_pk = ~np.isnan(y_corr_pk) & ~np.isnan(df["h_true"].values)
+            if mask_pk.sum() >= 30:
+                rmse_pk = float(np.sqrt(np.mean((y_corr_pk[mask_pk] - df["h_true"].values[mask_pk]) ** 2)))
+                note_extra += (
+                    f" | Pakse assist: k={params_pk['k']}, N={int(mask_pk.sum())}, "
+                    f"RMSE_adj={rmse_pk:.3f} m (vs {rmse:.3f})"
+                )
+            # put back into the table for export/inspection
+            df["h_pred_Pakse"] = y_corr_pk
+            df["delta_Pakse"] = deltas_pk
+
     # plot
     fig = plt.figure(figsize=(10.5, 4.0))
     plt.plot(df["date"], df["h_true"], label="Observed", linewidth=1.8)
     plt.plot(df["date"], df["h_pred"], label="FNO (1-day ahead)", linewidth=1.8)
+    if y_corr_pk is not None:
+        plt.plot(df["date"], y_corr_pk, label="FNO + Pakse assist", linewidth=1.8)  # NEW
     if y_corr is not None:
         plt.plot(df["date"], y_corr, label="FNO + 3S assist", linewidth=1.8)
     plt.axhline(ALARM_LEVEL, linestyle="--", linewidth=1, label=f"Alarm {ALARM_LEVEL:.1f} m")
@@ -525,6 +551,8 @@ def ui_eval_ytd():
         df["changed"] = np.where(np.isfinite(df.get("delta_3S", np.nan)) & (np.abs(df.get("delta_3S", 0.0)) > 1e-6),
                                  True, False)
         cols += ["h_pred_3S", "delta_3S", "wet", "changed"]
+    if "h_pred_Pakse" in df.columns:      # NEW
+        cols += ["h_pred_Pakse", "delta_Pakse"]
 
     return fig, note, df[cols]
 
@@ -608,6 +636,31 @@ def _load_service():
     else:
         print(f"[3S] len={len(w3s_daily)}, range={min(w3s_daily.index)}→{max(w3s_daily.index)}")
 
+    # --- NEW: Pakse (013901) daily series: CSV ⊕ recent live ---
+    pakse_hist = _load_upstream_daily_csv(PAKSE_CSV)
+
+    live_pakse = None
+    try:
+        live_pakse = get_recent_daily_cached(
+            station_code=PAKSE_CODE,
+            cache_path=LIVE_CACHE_PAKSE,
+            ttl_seconds=900,
+        )
+    except Exception as e:
+        print("[pakse] live fetch skipped:", e)
+
+    live_pakse = series_from_any(live_pakse)
+
+    if pakse_hist is not None and len(pakse_hist) > 0:
+        pakse_daily = _merge_hist_and_live_no_gaps(pakse_hist, live_pakse, fill_small_holes=True)
+    else:
+        pakse_daily = series_from_any(live_pakse)
+
+    if pakse_daily is not None and len(pakse_daily) > 0:
+        print(f"[PAKSE] len={len(pakse_daily)}, range={min(pakse_daily.index)}→{max(pakse_daily.index)}")
+    else:
+        print("[PAKSE] empty after load/merge")
+
     # try to load historical residual band
     resid_sigma = None
     if os.path.exists(RESID_PATH):
@@ -619,6 +672,7 @@ def _load_service():
         resid_sigma=resid_sigma,  # residual band statistics
         mc_cache={},  # MC Dropout results cache
         w3s_daily=w3s_daily,
+        pakse_daily=pakse_daily,
         ready=True
     ))
 
@@ -744,33 +798,33 @@ def ui_compare_fno_vs_3s_window():
     runner, water_daily = S["runner"], S["water_daily"]
     w3s_daily = S.get("w3s_daily")
 
-    # 先用现有回测拿到 2025 YTD 的基准 df（含 h_true/h_pred）
+    # use the existing backtest to obtain the baseline 2025 YTD DataFrame (containing h_true/h_pred)
     df, rmse = _backtest_ytd_1day(runner, water_daily, start="2025-01-01")
     if df is None or len(df) == 0:
         return pd.DataFrame({"message": ["Not enough data to backtest 2025 YTD."]})
 
-    # 如果没有 3S，直接返回提示
+    # when 3S data is unavailable, return a message directly
     if w3s_daily is None or len(w3s_daily) == 0:
         return pd.DataFrame({"message": ["3S daily series (014500) is empty."]})
 
-    # 拟合 3S 残差修正参数（与你在图上用的是同一套）
+    # fit the 3S residual-correction parameters
     params = _fit_3s_residual_model(df, w3s_daily, k_grid=(0, 1, 2, 3))
     if not params:
         return pd.DataFrame({"message": ["Not enough samples to fit 3S assist parameters."]})
 
-    # 应用校正，得到 y_corr（FNO+3S）
+    # apply the correction to obtain y_corr (FNO+3S)
     y_corr, _ = _apply_3s_correction(df, w3s_daily, params)
 
-    # —— 关键：只在“3S 可用（考虑滞后 k）”的日期上做比较 ——
+    # compare only on dates where 3S data is available (considering lag k)
     k = int(params["k"])
     dates = pd.to_datetime(df["date"]).dt.date.values
     lag_dates = np.array([d - pd.Timedelta(days=k) for d in dates], dtype="object")
 
-    # 3S 可用：在 w3s_daily 里存在且非 NaN
+    # 3S available: present in w3s_daily and not NaN
     has_3s = np.array([(d in w3s_daily.index) and pd.notna(w3s_daily.get(d))
                        for d in lag_dates], dtype=bool)
 
-    # 还要求 h_true/h_pred/y_corr 都是有效值
+    # h_true/h_pred/y_corr should be valid
     h_true = df["h_true"].values.astype(float)
     h_pred = df["h_pred"].values.astype(float)
     mask = has_3s & np.isfinite(h_true) & np.isfinite(h_pred) & np.isfinite(y_corr)
@@ -778,7 +832,6 @@ def ui_compare_fno_vs_3s_window():
     if mask.sum() == 0:
         return pd.DataFrame({"message": ["No overlapping dates where 3S (with lag k) is available."]})
 
-    # 计算 RMSE / MAE：FNO vs FNO+3S，仅在 mask 窗口内
     idx = np.where(mask)[0]
     d_sub = dates[idx]
     start_d = d_sub.min(); end_d = d_sub.max(); N = int(len(idx))
@@ -804,6 +857,79 @@ def ui_compare_fno_vs_3s_window():
         "MAE (FNO)":      round(mae_fno,  3),
         "MAE (FNO+3S)":   round(mae_3s,   3),
         "ΔMAE":           round(mae_3s - mae_fno, 3),
+    }])
+
+    return out
+
+def ui_compare_fno_vs_pakse_window():
+    """
+    Compare FNO vs FNO+Pakse assist on dates where Pakse data are available (with lag k).
+    Returns a single-row DataFrame with RMSE/MAE for both methods within that window.
+    """
+    S = _load_service()
+    runner, water_daily = S["runner"], S["water_daily"]
+    pakse_daily = S.get("pakse_daily")
+
+    # baseline backtest (with h_true/h_pred)
+    df, rmse = _backtest_ytd_1day(runner, water_daily, start="2025-01-01")
+    if df is None or len(df) == 0:
+        return pd.DataFrame({"message": ["Not enough data to backtest 2025 YTD."]})
+
+    # pakse data is missing
+    if pakse_daily is None or len(pakse_daily) == 0:
+        return pd.DataFrame({"message": ["Pakse daily series (013901) is empty."]})
+
+    # residual-correction parameters using the Pakse station data
+    params_pk = _fit_3s_residual_model(df, pakse_daily, k_grid=(0, 1, 2, 3))
+    if not params_pk:
+        return pd.DataFrame({"message": ["Not enough samples to fit Pakse assist parameters."]})
+
+    # apply the correction to obtain y_corr_pk (FNO+Pakse)
+    y_corr_pk, _ = _apply_3s_correction(df, pakse_daily, params_pk)
+
+    # compare only on dates where Pakse data is available
+    k = int(params_pk["k"])
+    dates = pd.to_datetime(df["date"]).dt.date.values
+    lag_dates = np.array([d - pd.Timedelta(days=k) for d in dates], dtype="object")
+
+    # check the data availability of the Pakse station
+    has_pk = np.array([(d in pakse_daily.index) and pd.notna(pakse_daily.get(d))
+                       for d in lag_dates], dtype=bool)
+
+    # h_true/h_pred/y_corr_pk should be valid
+    h_true = df["h_true"].values.astype(float)
+    h_pred = df["h_pred"].values.astype(float)
+    mask = has_pk & np.isfinite(h_true) & np.isfinite(h_pred) & np.isfinite(y_corr_pk)
+
+    if mask.sum() == 0:
+        return pd.DataFrame({"message": ["No overlapping dates where Pakse (with lag k) is available."]})
+
+    # compute RMSE/MAE only within the masked window
+    idx = np.where(mask)[0]
+    d_sub = dates[idx]
+    start_d = d_sub.min(); end_d = d_sub.max(); N = int(len(idx))
+
+    h_t   = h_true[idx]
+    y_fno = h_pred[idx]
+    y_pk  = y_corr_pk[idx]
+
+    rmse_fno = float(np.sqrt(np.mean((y_fno - h_t) ** 2)))
+    rmse_pk  = float(np.sqrt(np.mean((y_pk  - h_t) ** 2)))
+    mae_fno  = float(np.mean(np.abs(y_fno - h_t)))
+    mae_pk   = float(np.mean(np.abs(y_pk  - h_t)))
+
+    out = pd.DataFrame([{
+        "Window":             "Pakse-available (with lag k)",
+        "k (days)":           k,
+        "N":                  N,
+        "From":               str(start_d),
+        "To":                 str(end_d),
+        "RMSE (FNO)":         round(rmse_fno, 3),
+        "RMSE (FNO+Pakse)":   round(rmse_pk,  3),
+        "ΔRMSE":              round(rmse_pk - rmse_fno, 3),
+        "MAE (FNO)":          round(mae_fno,  3),
+        "MAE (FNO+Pakse)":    round(mae_pk,   3),
+        "ΔMAE":               round(mae_pk - mae_fno, 3),
     }])
 
     return out
@@ -847,6 +973,17 @@ def build_app():
                 btn_cmp.click(fn=ui_compare_fno_vs_3s_window, inputs=None, outputs=cmp_tbl)
                 # automatically refresh once after the backtest completes
                 bt_evt.then(fn=ui_compare_fno_vs_3s_window, inputs=None, outputs=cmp_tbl)
+
+                # --- NEW: FNO vs FNO+Pakse comparison within the Pakse-available window ---
+                gr.Markdown("### FNO vs FNO + Pakse (Only where Pakse is available)")
+                with gr.Row():
+                    btn_cmp_pk = gr.Button("Compare on Pakse-available dates (RMSE & MAE)", variant="secondary")
+                pk_tbl = gr.Dataframe(interactive=False)
+
+                # manual refresh
+                btn_cmp_pk.click(fn=ui_compare_fno_vs_pakse_window, inputs=None, outputs=pk_tbl)
+                # automatically refresh once after the backtest completes
+                bt_evt.then(fn=ui_compare_fno_vs_pakse_window, inputs=None, outputs=pk_tbl)
 
                 gr.Markdown("---")
 
