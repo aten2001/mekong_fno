@@ -485,8 +485,8 @@ def ui_eval_ytd(horizon=1):
         plt.plot(df["date"], y_corr, label=f"FNO + 3S ({horizon}-day)", linewidth=1.8)
     if y_corr_pk is not None:
         plt.plot(df["date"], y_corr_pk, label=f"FNO + Pakse ({horizon}-day)", linewidth=1.8)
-    plt.axhline(ALARM_LEVEL, linestyle="--", linewidth=1, label=f"Alarm {ALARM_LEVEL:.1f} m")
-    plt.axhline(FLOOD_LEVEL, linestyle="--", linewidth=1, label=f"Flood {FLOOD_LEVEL:.1f} m")
+    plt.axhline(ALARM_LEVEL, linestyle="--", color="darkgoldenrod", linewidth=1, label=f"Alarm {ALARM_LEVEL:.1f} m")
+    plt.axhline(FLOOD_LEVEL, linestyle="--", color="red", linewidth=1, label=f"Flood {FLOOD_LEVEL:.1f} m")
     plt.title(f"2025 YTD — Observed vs Predicted ({horizon}-day ahead)")
     plt.xlabel("Date"); plt.ylabel("Water Level (m)")
     plt.xticks(rotation=20); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
