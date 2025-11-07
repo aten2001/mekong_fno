@@ -1,10 +1,22 @@
 # scripts/train_export.py
 import os
+
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")      # deterministic ops
+os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")    # adapt for older TensorFlow versions
+
 import json
 import sys
 import time
 import argparse
+import random
 import numpy as np
+import tensorflow as tf
+
+# set unified random seed
+SEED = 1337
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
 from src.runner import TenYearUnifiedRunner, build_climatology_from_train_years
 
