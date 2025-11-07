@@ -23,7 +23,7 @@ from src.runner import doy_no_leap
 from src.live_mrc import get_recent_daily_cached
 from src.backfill import BACKFILL_PATH, read_backfill, write_backfill, series_from_any
 
-SEQ_LENGTH = 120
+SEQ_LENGTH = 150
 PRED_LENGTH = 7
 ART_DIR = "artifacts"
 WEIGHTS_DIR = "weights"
