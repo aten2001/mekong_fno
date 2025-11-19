@@ -29,33 +29,50 @@ ART_DIR = "artifacts"
 WEIGHTS_DIR = "weights"
 CSV_DIR = os.environ.get("CSV_DIR", "data")
 
-# 3S at Sekong bridge (014500) CSV
-W3S_CSV = os.path.join(CSV_DIR, "Water Level.TelemetryKH_014500_3S at Sekong bridge.csv")
-
-# --- NEW: Pakse (013901) paths & live cache ---
+# --- Pakse (013901) paths & live cache ---
 PAKSE_CSV = os.path.join(CSV_DIR, "Water Level.ManualLA_013901_Pakse.csv")
 PAKSE_CODE = os.environ.get("PAKSE_CODE", "013901")
 LIVE_CACHE_PAKSE = os.path.join(ART_DIR, "live_recent_pakse.json")
+
+# --- 3S (014500) paths & live cache ---
+W3S_CSV = os.path.join(CSV_DIR, "Water Level.TelemetryKH_014500_3S at Sekong bridge.csv")
+W3S_CODE = os.environ.get("W3S_CODE", "014500")
+LIVE_CACHE_3S = os.path.join(ART_DIR, "live_recent_3s.json")
 
 CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
 NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
 PHASE_JSON = os.path.join(ART_DIR, "phase_report.json")
 RESID_PATH = os.path.join(ART_DIR, "residual_sigma.json")  # historical residual band
+
 # --- risk thresholds shown on YTD backtest plot ---
 ALARM_LEVEL = 10.7   # Alarm level: 10.7 m
 FLOOD_LEVEL = 12.0   # Flood level: 12 m
 
-# === merge historical & live data into a continuous daily series (auto-fill “internal 1-day gaps”) ===
+# --- season config for upstream (Pakse) assist ---
+WET_MONTHS = (6, 7, 8, 9, 10, 11)
+DRY_SHRINK = float(os.environ.get("PAKSE_DRY_SHRINK", "0.4"))  # dry-season shrink factor λ, default 0.4
+
 from typing import Optional
 
 def _merge_hist_and_live_no_gaps(water_daily_hist: pd.Series,
                                  live_daily: Optional[pd.Series],
                                  fill_small_holes: bool = True) -> pd.Series:
     """
-    Return a continuous daily water_daily series (index = Python date, value = h)
-    - use live data to overwrite/extend the tail of the historical series
-    - rebuild a complete daily calendar index
-    - interpolate (or forward-fill) internal gaps of ≤1 day
+    Use live data to overwrite/extend the tail of the historical series. Rebuild
+    a complete daily calendar index. Interpolate (or forward-fill) internal gaps
+    of ≤1 day.
+
+    Args:
+        water_daily_hist (pd.Series):
+            historical daily water level series.
+        live_daily (Optional[pd.Series]):
+            optional "live/backfill" daily series to merge on top of history.
+        fill_small_holes (bool, optional):
+            if True, fill at most 1-day internal gap.
+
+    Returns:
+         pandas.Series:
+            a continuous daily water_daily series (index = Python date, value = h)
     """
     def _to_dt_index(s: Optional[pd.Series]) -> pd.Series:
         if s is None or len(s) == 0:
@@ -76,7 +93,7 @@ def _merge_hist_and_live_no_gaps(water_daily_hist: pd.Series,
     full = pd.date_range(wd.index.min(), wd.index.max(), freq="D")
     wd = wd.reindex(full)
 
-    # fill with linear interpolation only internal small gaps;
+    # fill with linear interpolation only at most 1-day internal gap;
     # leave endpoints untouched.
     if fill_small_holes:
         wd = wd.interpolate(limit=1, limit_area="inside")
@@ -84,9 +101,21 @@ def _merge_hist_and_live_no_gaps(water_daily_hist: pd.Series,
     # convert the index back to Python date to stay consistent with existing code
     return pd.Series(wd.values, index=wd.index.date)
 
-#  read the upstream-station CSV → aggregate by local (UTC+7) calendar days
-#  into a daily-mean Series (index = Python date → float)
-def _load_upstream_daily_csv(path: str):
+def _load_upstream_daily_csv(path: str) -> Optional[pd.Series]:
+    """
+    Load an upstream-station CSV and converts timestamps to Asia/Bangkok (UTC+07),
+    drops invalid timestamps, groups by local calendar day, and computes daily means.
+    Then reindexes to a complete daily calendar and linearly interpolates internal gaps
+    up to 1 day.
+
+    Args:
+        path:
+            Path to the CSV file.
+
+    Returns:
+        pandas.Series | None:
+            a continuous daily water daily series (index = Python date, value = h) or ``None`` if CSV file not exist.
+    """
     if not os.path.exists(path):
         print(f"[3S] file not found: {path}")
         return None
@@ -142,14 +171,33 @@ def _load_upstream_daily_csv(path: str):
 
     return s
 
-# fit FNO residuals using only the wet season (default Jun–Oct)
-# features = [3S water level, 3S first difference], with lag k (0..3)
 def _fit_3s_residual_model(
     df_backtest: pd.DataFrame,
     w3s_daily: pd.Series,
-    k_grid=(0, 1, 2, 3),
-    wet_months=(6, 7, 8, 9, 10),
+    k_grid=(0, 1, 2, 3, 4, 5),
+    wet_months=None,
 ):
+    """
+    Fit a wet-season residual correction using upstream (3S-station) daily level and its first
+    difference with a scanned lag k.
+
+    Args:
+        df_backtest (pd.DataFrame):
+            backtest samples with at least the columns.
+        w3s_daily (pd.Series):
+            upstream (3S-station) daily-mean water level.
+        k_grid (Iterable[int], optional):
+            candidate integer lags (days) to scan.
+        wet_months (Iterable[int] | None, optional):
+            months treated as wet season.
+
+    Returns:
+        dict | None:
+            Best-fit parameter bundle or ``None`` if insufficient samples.
+    """
+    if wet_months is None:
+        wet_months = WET_MONTHS
+
     df = df_backtest.copy()
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["err"] = df["h_true"] - df["h_pred"]
@@ -214,8 +262,29 @@ def _fit_3s_residual_model(
         print("[3S-fit] not enough samples to fit")
     return best
 
-# apply 3S station correction: y_corr = h_pred + (a + b1*z1 + b2*z2)，where z* are [level, diff] after standardized
 def _apply_3s_correction(df_backtest: pd.DataFrame, w3s_daily: pd.Series, params: dict):
+    """
+    Apply a linear residual correction using the upstream 3S station.
+    The correction is applied only in wet-season months; in dry-season months
+    the prediction is returned unchanged. Upstream series are aligned by a
+    learned integer lag k (days). Internal gaps up to 1 day in the upstream
+    series are linearly interpolated; endpoints are left untouched.
+
+    Args:
+      df_backtest (pd.DataFrame):
+        Backtest rows containing at least: ``date`` (datetime-like) and ``h_pred`` (float): model prediction for the target date.
+      w3s_daily (pd.Series):
+        Upstream 3S daily mean water level series.
+      params (dict):
+        Fitted parameters produced by ``_fit_3s_residual_model``
+
+    Returns:
+      Tuple[np.ndarray, np.ndarray]:
+        - ``y_corr`` (np.ndarray, shape [N], dtype float32):
+            corrected forecasts aligned to ``df_backtest['date']``.
+        - ``deltas`` (np.ndarray, shape [N], dtype float32):
+            the additive residual term applied to ``h_pred`` .
+    """
     if not params:
         return np.full(len(df_backtest), np.nan), np.full(len(df_backtest), np.nan)
 
@@ -224,7 +293,7 @@ def _apply_3s_correction(df_backtest: pd.DataFrame, w3s_daily: pd.Series, params
     mu = np.asarray(params["mu"], dtype=np.float64)   # [2] for [level, diff]
     sd = np.asarray(params["sd"], dtype=np.float64)   # [2]
     k  = int(params["k"])
-    wet_months = set(params.get("months", [6,7,8,9,10]))
+    wet_months = set(params.get("months", list(WET_MONTHS)))
 
     # align to the date index lagged by k days
     # allowing interpolation over gaps up to 1 day
@@ -261,13 +330,180 @@ def _apply_3s_correction(df_backtest: pd.DataFrame, w3s_daily: pd.Series, params
 
     return np.array(y_corr, np.float32), np.array(deltas, np.float32)
 
+def _fit_pakse_params_for_tab1(runner, water_daily, pakse_daily, horizon_for_fit=1) -> Optional[dict]:
+    """
+    Fit a linear residual-correction model using the upstream Pakse station
+    for use in Tab1's 7-day forecast overlay.The fit is restricted to months
+    in wet-season. The best lag k is selected from a grid (0..5)
+    by minimizing residual RMSE.
 
-# === determine continuity using only “valid (non-NaN) values” and return the last day of the contiguous block as the anchor ===
+    Args:
+      runner (TenYearUnifiedRunner):
+        Runner with model/climatology/norm stats.
+      water_daily (pd.Series):
+        Target-station daily mean water level (meters).
+      pakse_daily (pd.Series):
+        Upstream Pakse daily mean water level (meters).
+      horizon_for_fit (int, optional):
+        k-day-ahead horizon used to construct the backtest pairs for fitting.
+        Defaults to 1.
+
+    Returns:
+      Optional[dict] | None:
+        A parameter dictionary as produced by ``_fit_3s_residual_model`` or ``None`` if insufficient data.
+    """
+    if pakse_daily is None or len(pakse_daily) == 0:
+        return None
+    df_fit, _ = _backtest_ytd_1day(runner, water_daily, start="2025-01-01", horizon=horizon_for_fit)
+    if df_fit is None or len(df_fit) == 0:
+        return None
+    params_pk = _fit_3s_residual_model(df_fit, pakse_daily, k_grid=(0, 1, 2, 3, 4, 5), wet_months=WET_MONTHS)
+    return params_pk
+
+def _fit_w3s_params_for_tab1(runner, water_daily, w3s_daily, horizon_for_fit=1):
+    """
+    Fit a linear residual-correction model using the upstream 3S station
+    for use in Tab1's 7-day forecast overlay.The fit is restricted to wet-season
+    months (``WET_MONTHS``). The best lag k is selected from a small grid (0..3)
+    by minimizing residual RMSE.
+
+    Args:
+      runner (TenYearUnifiedRunner):
+        Runner with model/climatology/norm stats.
+      water_daily (pd.Series):
+        Target-station daily mean water level (meters).
+      pakse_daily (pd.Series):
+        Upstream Pakse station daily mean water level (meters).
+      horizon_for_fit (int, optional):
+        k-day-ahead horizon used to construct the backtest pairs for fitting.
+        Defaults to 1.
+
+    Returns:
+      Optional[dict] | None:
+        A parameter dictionary as produced by ``_fit_3s_residual_model`` on the
+        backtest window using ``3S_daily``, or ``None`` if insufficient data.
+    """
+    if w3s_daily is None or len(w3s_daily) == 0:
+        return None
+    df_fit, _ = _backtest_ytd_1day(runner, water_daily, start="2025-01-01", horizon=horizon_for_fit)
+    if df_fit is None or len(df_fit) == 0:
+        return None
+    params_3s = _fit_3s_residual_model(df_fit, w3s_daily, k_grid=(0, 1, 2, 3), wet_months=WET_MONTHS)
+    return params_3s
+
+def _apply_upstream_correction_future(y_pred_7, fut_dates, upstream_daily, params, shrink_dry=DRY_SHRINK, allow_interp=True):
+    """
+    Apply a fitted linear residual-correction model from an upstream station to a
+    multi-day forecast window.only use upstream values whose lagged date ≤ today;
+    optionally allow interpolation across internal gaps ≤ 1 day in the upstream
+    daily series; in months not in the wet-season set, the delta is scaled by
+    `shrink_dry` ∈ [0, 1]; no scaling during wet season.
+
+    Args:
+      y_pred_7 (Sequence[float] | np.ndarray):
+        Forecast for each step in the future 7-days window.
+      fut_dates (Sequence[pandas.Timestamp] | pandas.DatetimeIndex | Sequence[date-like]):
+        Future target dates aligned with `y_pred_7`. Length defines the number
+        of steps `n` (the function works for any `n`, though designed for 7).
+      upstream_daily (pd.Series):
+        Upstream station daily means.
+      params (Mapping[str, Any]):
+        Fitted parameter dict produced by `_fit_3s_residual_model`.
+      shrink_dry (float, optional):
+        Multiplicative shrink applied to the delta during non-wet months.
+        Range [0, 1]. Defaults to `DRY_SHRINK`.
+      allow_interp (bool, optional):
+        If True, fill internal ≤1-day gaps in `upstream_daily` after reindexing
+        to the lagged date grid. Defaults to True.
+
+    Returns:
+      Tuple[np.ndarray, np.ndarray, int, Optional[int]]:
+        - y_out: float32 array (n,), corrected forecast with NaN at positions
+          where correction cannot be applied (kept NaN to break lines in plots).
+        - used: bool array (n,), True where an upstream-based correction was
+          actually applied.
+        - avail: int, number of usable corrected steps in this window.
+        - k: int | None, the lag (days) taken from `params` or None if no
+          valid params were provided.
+    """
+    n = len(fut_dates)
+    if not params or upstream_daily is None or len(upstream_daily) == 0:
+        return np.full(n, np.nan, np.float32), np.zeros(n, dtype=bool), 0, None
+
+    a  = float(params["a"])
+    b1 = float(params["b1"]); b2 = float(params["b2"])
+    mu = np.asarray(params["mu"], dtype=np.float64)
+    sd = np.asarray(params["sd"], dtype=np.float64)
+    k  = int(params["k"])
+    wet_months = set(params.get("months", list(WET_MONTHS)))
+
+    dates = pd.to_datetime(fut_dates).normalize().date
+    lag_dates = np.array([d - pd.Timedelta(days=k) for d in dates], dtype="object")
+
+    # align the upstream series by the lag
+    s_lvl = upstream_daily.reindex(lag_dates)
+    if allow_interp and len(s_lvl) > 0:
+        s_lvl = s_lvl.interpolate(limit=1, limit_area="inside")
+
+    today = _today_utc7_date()
+    # disable upstream values lag_date > today
+    for i, ld in enumerate(lag_dates):
+        if ld is None:
+            s_lvl.iloc[i] = np.nan
+            continue
+        d_ld = pd.to_datetime(ld)
+        if pd.isna(d_ld):
+            s_lvl.iloc[i] = np.nan
+            continue
+        if d_ld.date() > today:
+            s_lvl.iloc[i] = np.nan
+
+    s_d1 = s_lvl.diff()
+    if len(s_d1) > 0:
+        first_valid = np.where(~pd.isna(s_d1))[0]
+        if len(first_valid):
+            s_d1.iloc[first_valid[0]] = 0.0
+
+    y_out  = np.array(y_pred_7, dtype=np.float32).copy()
+    used   = np.zeros(n, dtype=bool)
+
+    for i, (d, hp, x1, x2) in enumerate(zip(dates, y_pred_7, s_lvl.values, s_d1.values)):
+        if pd.isna(hp) or pd.isna(x1) or pd.isna(x2):
+            # if unavailable, set to NaN to break the plot line
+            y_out[i] = np.nan
+            continue
+        z = (np.array([float(x1), float(x2)]) - mu) / (sd + 1e-8)
+        delta = float(a + b1 * z[0] + b2 * z[1])
+        if d.month not in wet_months:
+            delta *= float(shrink_dry)
+        y_out[i] = float(hp + delta)
+        used[i] = True
+
+    avail = int(used.sum())
+    return y_out, used, avail, k
+
 def _latest_contiguous_anchor(water_daily: pd.Series, need: int = 120) -> pd.Timestamp.date:
     """
-    Scan backward from the last day in water_daily to find the most recent block
-    with “≥ need days” of continuity, and return its last day as the anchor;
-    Count only dates with non-NaN values toward continuity;
+    Find the most recent contiguous run of valid daily observations and return
+    the last day (most recent day) of that run as the anchor.
+
+    Args:
+      water_daily (pd.Series):
+        Daily water level series.
+      need (int, optional):
+        Required length (in calendar days) of a contiguous, gap-free block of
+        valid (non-NaN) observations.
+        Defaults to 120.
+
+    Returns:
+      datetime.date:
+        The last day of the most recent contiguous block whose length is
+        at least `need`. This date serves as the anchor (end) of the input
+        window for forecasting.
+
+    Raises:
+      ValueError: If `len(water_daily) < need`, or if no contiguous block of
+        length `need` can be found when scanning backward.
     """
     if len(water_daily) < need:
         raise ValueError(f"Not enough data for a {need}-day window (currently {len(water_daily)} days).")
@@ -296,6 +532,21 @@ STATION_CODE = os.environ.get("STUNG_TRENG_CODE", "014501")
 LIVE_CACHE   = os.path.join(ART_DIR, "live_recent_daily.json")
 
 def _find_ckpt(weights_dir=WEIGHTS_DIR):
+    """
+    Locate a TensorFlow checkpoint prefix under the given weights directory.
+
+    Args:
+      weights_dir (str):
+        Directory path that contains TensorFlow checkpoint files.
+        Defaults to the module-level `WEIGHTS_DIR`.
+
+    Returns:
+      str:
+        Filesystem path to the checkpoint *prefix* (without extension).
+
+    Raises:
+      FileNotFoundError: If no checkpoint can be found in `weights_dir`.
+    """
     ckpt = tf.train.latest_checkpoint(weights_dir)
     if ckpt: return ckpt
     idx = glob.glob(os.path.join(weights_dir, "*.ckpt.index"))
@@ -303,6 +554,16 @@ def _find_ckpt(weights_dir=WEIGHTS_DIR):
     raise FileNotFoundError("No TF checkpoint found in 'weights/'")
 
 def _today_utc7_date():
+    """
+    Return today's calendar date in UTC+07 (Asia/Bangkok), with a safe fallback.
+
+    Returns:
+      datetime.date: Today's date in UTC+07 when available; otherwise today's
+        UTC date. The return value is a Python `date` (no timezone attached).
+
+    Raises:
+      None: All exceptions are caught; the function degrades to a UTC-based date.
+    """
     try:
         tz = ZoneInfo("Asia/Bangkok")
         return pd.Timestamp.now(tz=tz).date()
@@ -310,6 +571,25 @@ def _today_utc7_date():
         return pd.Timestamp.utcnow().date()
 
 def _norm_inputs_like_train(X, st):
+    """
+    Normalize input features with the same statistics used at training time.
+
+    Args:
+      X (np.ndarray): Input array of shape `[batch, seq_len, n_features]`.
+        Must have `n_features >= 4` so that channels 0, 2, and 3 exist.
+      st (Mapping[str, float]): Training-time normalization stats containing
+        the following keys:
+          - 't_mean', 't_std'
+          - 'h_in_mean', 'h_in_std'
+          - 'dh_in_mean', 'dh_in_std'
+
+    Returns:
+      np.ndarray: A normalized copy of `X` with the same shape and dtype as `X`.
+
+    Raises:
+      KeyError: If any required key is missing from `st`.
+      ValueError: If the last dimension of `X` is smaller than 4.
+    """
     Xn = X.copy()
     Xn[:, :, 0] = (Xn[:, :, 0] - st['t_mean']) / (st['t_std'] + 1e-8)
     Xn[:, :, 2] = (Xn[:, :, 2] - st['h_in_mean']) / (st['h_in_std'] + 1e-8)
@@ -318,8 +598,32 @@ def _norm_inputs_like_train(X, st):
 
 def _build_window_Xn(runner, water_daily: pd.Series, date_anchor: pd.Timestamp):
     """
-    runner.predict_h_range’s window construction and normalization
-     (build only Xn and the next 7 dates)
+    Construct the model input window (length = `SEQ_LENGTH`) ending at `date_anchor`,
+    compute 6 per-day features, and normalize them exactly like training.
+    Also return the next `PRED_LENGTH` future calendar dates for prediction.
+
+    Args:
+      runner (TenYearUnifiedRunner):
+        Provides training configuration and statistics.
+      water_daily (pd.Series):
+        Daily water level series.
+        Values are floats; any NaN inside the required window is
+        considered missing and will raise `ValueError`.
+      date_anchor (pd.Timestamp | datetime.date | str):
+        The last day (inclusive) of the input window.
+
+    Returns:
+      Tuple[np.ndarray, pd.DatetimeIndex]:
+        - Xn: float32 array of shape (1, SEQ_LENGTH, 6) containing the
+          normalized features in the channel order described above.
+        - fut_dates: `pd.DatetimeIndex` of length `PRED_LENGTH` (typically 7)
+          for the subsequent forecast days, with Feb 29 removed; if Feb 29
+          would truncate the span, extra days are appended to maintain length.
+
+    Raises:
+      ValueError:
+        If any day within the `SEQ_LENGTH`-day window is absent from
+        `water_daily` or has a NaN value (i.e., the window is not fully valid).
     """
     date_anchor = pd.to_datetime(date_anchor).normalize()
     L = int(SEQ_LENGTH)
@@ -372,25 +676,78 @@ def _build_window_Xn(runner, water_daily: pd.Series, date_anchor: pd.Timestamp):
 
 def _predict_7_abs(runner, Xn, fut_dates, training=False):
     """
-    forward: standardized anomaly → de-standardize → add back climatology
-    (use the 7th-day DOY for all steps, consistent with training/evaluation)
+    Run the model forward to get 7-step **standardized anomalies**, de-standardize them,
+    and convert to **absolute** water levels by adding a per-day climatology term.
+
+    The model outputs a 7×1 vector of standardized anomalies (z-scores) for the next
+    `PRED_LENGTH` days. These are first mapped back to physical units using
+    `runner.norm_stats['h_mean']` and `runner.norm_stats['h_std']`, then a climatology
+    value is added **for each forecast day** based on its day-of-year (DOY) computed
+    with a no-leap calendar.
+
+    Args:
+      runner (TenYearUnifiedRunner):
+        Container that provides:
+          - `model` (tf.keras.Model): maps `(1, SEQ_LENGTH, 6)` → `(1, PRED_LENGTH, 1)`.
+          - `norm_stats` (dict): must contain keys `'h_mean'` and `'h_std'` for de-standardizing
+            the anomaly output back to meters.
+          - `clim` (array-like): climatology baseline indexed by DOY from `doy_no_leap(...)`.
+      Xn (np.ndarray):
+        Normalized input tensor of shape `(1, SEQ_LENGTH, 6)` and dtype float32, constructed
+        the same way as in training (see `_build_window_Xn`).
+      fut_dates (Sequence[pandas.Timestamp] | pandas.DatetimeIndex):
+        Future calendar dates for the forecast horizon. Must have length `PRED_LENGTH`
+        (typically 7), and should not contain Feb 29 (the upstream code removes it).
+      training (bool, optional):
+        If `True`, keeps dropout etc. active for MC Dropout sampling; if `False`,
+        runs in deterministic/eval mode. Defaults to `False`.
+
+    Returns:
+      np.ndarray:
+        A float32 array of shape `(PRED_LENGTH,)` containing **absolute** water-level
+        predictions (in meters) aligned with `fut_dates` order.
     """
     y_pred_n = runner.model(Xn, training=training).numpy()  # [1,7,1]
     st = runner.norm_stats
     y_pred_anom = (y_pred_n * st['h_std'] + st['h_mean'])[0, :, 0]  # [7]
 
-    # add the 7th-day DOY to the entire sequence (consistent with evaluation)
-    tgt_day = pd.to_datetime(fut_dates[-1]).normalize()
-    tgt_doy = doy_no_leap(tgt_day)
-    clim_add = np.full((PRED_LENGTH,), float(runner.clim[tgt_doy]), dtype=np.float32)
+    doys = [doy_no_leap(pd.to_datetime(d).normalize()) for d in fut_dates]
+    clim_add = np.array([float(runner.clim[d]) for d in doys], dtype=np.float32)
     return (y_pred_anom + clim_add).astype(np.float32)
 
 def _backtest_ytd_1day(runner, water_daily, start="2025-01-01", end=None, horizon=1):
     """
-    k-day-ahead backtest from 2025-01-01 to today (or a specified end date)
-    For each target day T: build a 120-day window with anchor = T - k, forecast the next 7 days,
-    and compare day-k with the observation on T.
-    Returns: df(date, h_true, h_pred, err), rmse
+    Run a k-day-ahead backtest over a date range (default: 2025-01-01 → today, UTC+07).
+    The prediction for day T+k uses only observations up to day T (via the anchor), and
+    never uses earlier forecasted values as inputs.
+
+    Args:
+      runner (TenYearUnifiedRunner):
+        Wrapper providing the trained model, normalization stats, and climatology.
+      water_daily (pandas.Series):
+        Daily observed water levels for the target station.
+        Missing days or NaNs are skipped for those anchors/targets.
+      start (str | datetime.date | pandas.Timestamp, optional):
+        Inclusive start date of the backtest window.
+      end (str | datetime.date | pandas.Timestamp | None, optional):
+        Exclusive upper bound of the iteration after normalization to a date.
+      horizon (int, optional):
+        k-day-ahead horizon (1 ≤ k ≤ `PRED_LENGTH`). `k=1` evaluates D+1,
+        `k=7` evaluates D+7.
+        Defaults to 1.
+
+    Returns:
+      tuple[pandas.DataFrame, float | None]:
+        - DataFrame with columns:
+            * `date`   (Timestamp): target day **T**
+            * `h_true` (float): observed level on **T**
+            * `h_pred` (float): k-day-ahead prediction for **T** (taken from
+                               index `k-1` of the 7-step forecast)
+            * `err`    (float): `h_pred - h_true`
+        - `rmse` (float | None): RMSE over all rows; `None` if the DataFrame is empty.
+
+    Raises:
+      ValueError: If `horizon` is not in `[1, PRED_LENGTH]`.
     """
     if end is None:
         end = _today_utc7_date()
@@ -438,8 +795,27 @@ def _backtest_ytd_1day(runner, water_daily, start="2025-01-01", end=None, horizo
 
 def ui_eval_ytd(horizon=1):
     """
-    Plot the 2025 YTD ‘Observed vs Predicted’ (k-day ahead, k=1..7) and provide an RMSE summary.
-    Also plot “FNO + 3S assist” and “FNO + Pakse assist” for the same horizon when available.
+    Plot 2025 year-to-date k-day-ahead in [1,2,3,4,5,6,7] backtest (Observed vs Predicted) and summarize RMSE.
+
+    Args:
+      horizon (int, optional):
+        k-day-ahead horizon to evaluate and plot (1 ≤ k ≤ `PRED_LENGTH`).
+        `1` means next-day (D+1); `7` means D+7. Defaults to `1`.
+
+    Returns:
+      tuple[matplotlib.figure.Figure | None, str, pandas.DataFrame]:
+        - fig: The matplotlib figure containing the YTD Observed vs Predicted plot.
+          `None` if not enough data to backtest.
+        - note: A summary line including the date window, horizon, sample size N,
+          base RMSE, alarm/flood levels, and any assist RMSE adjustments if available.
+          If data are insufficient, this contains an explanatory message.
+        - df: A DataFrame with at least the columns:
+            * `date` (Timestamp): evaluation date (target day T).
+            * `h_true` (float): observed level on T.
+            * `h_pred` (float): FNO k-day-ahead prediction for T.
+
+    Raises:
+      None. If insufficient data, returns `(None, <message>, empty DataFrame)`.
     """
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
@@ -502,7 +878,7 @@ def ui_eval_ytd(horizon=1):
     if "h_pred_3S" in df.columns:
         if "month" not in df.columns:
             df["month"] = pd.to_datetime(df["date"]).dt.month
-        df["wet"] = df["month"].isin([6, 7, 8, 9, 10])
+        df["wet"] = df["month"].isin(WET_MONTHS)
         df["changed"] = np.where(np.isfinite(df.get("delta_3S", np.nan)) & (np.abs(df.get("delta_3S", 0.0)) > 1e-6),
                                  True, False)
         cols += ["h_pred_3S", "delta_3S", "wet", "changed"]
@@ -515,7 +891,29 @@ def ui_eval_ytd(horizon=1):
 _APP_CACHE = dict()
 
 def _load_service():
-    """model/runner/daily series; load only once"""
+    """
+    Initialize and cache the end-to-end inference “service” (model, data, and upstream series).
+    Results are stored in a process-level singleton cache so subsequent calls are O(1).
+
+    Args:
+      None
+
+    Returns:
+      dict: A singleton dictionary containing:
+        - **runner** (`TenYearUnifiedRunner`): Configured runner with loaded data, clim, norm,
+          and the attached TensorFlow model.
+        - **water_daily** (`pandas.Series`): Continuous daily series (index=Python `date`,
+          value=`float` meters) after CSV/backfill/live merge.
+        - **resid_sigma** (`dict | None`): Residual band stats, if found in `RESID_PATH`.
+        - **mc_cache** (`dict`): In-memory cache for MC Dropout uncertainty windows.
+        - **w3s_daily** (`pandas.Series | None`): 3S station daily means after merge.
+        - **pakse_daily** (`pandas.Series | None`): Pakse station daily means after merge.
+        - **ready** (`bool`): Flag indicating the cache has been fully initialized.
+
+    Raises:
+      None. All external I/O is wrapped in `try/except` with diagnostics printed to stdout.
+      On failure to locate a TF checkpoint, `_find_ckpt()` will raise `FileNotFoundError`.
+    """
     if _APP_CACHE.get("ready"):
         return _APP_CACHE
     t0 = time.perf_counter()
@@ -576,21 +974,34 @@ def _load_service():
 
     print(f"[app] daily merged: days={len(water_daily)}, range={min(water_daily.index)}→{max(water_daily.index)}")
 
-    w3s_daily = _load_upstream_daily_csv(W3S_CSV)
-    if w3s_daily is not None and len(w3s_daily) > 0:
-        # Keep only the valid range
-        lo = pd.to_datetime("2024-04-06").date()
-        hi = pd.to_datetime("2025-09-21").date()
-        w3s_daily = w3s_daily.loc[lo:hi]
+    # 3S (014500) daily series: CSV ⊕ recent live
+    w3s_hist = _load_upstream_daily_csv(W3S_CSV)
+
+    live_3s = None
+    try:
+        live_3s = get_recent_daily_cached(
+            station_code=W3S_CODE,  # 014500
+            cache_path=LIVE_CACHE_3S,
+            ttl_seconds=900,
+        )
+    except Exception as e:
+        print("[3S] live fetch skipped:", e)
+
+    live_3s = series_from_any(live_3s)
+
+    if w3s_hist is not None and len(w3s_hist) > 0:
+        w3s_daily = _merge_hist_and_live_no_gaps(w3s_hist, live_3s, fill_small_holes=True)
+    else:
+        w3s_daily = series_from_any(live_3s)
 
     # debug
     print(f"[3S] path={W3S_CSV} exists={os.path.exists(W3S_CSV)}")
     if w3s_daily is None or len(w3s_daily) == 0:
-        print("[3S] empty after load/crop")
+        print("[3S] empty after load/merge")
     else:
         print(f"[3S] len={len(w3s_daily)}, range={min(w3s_daily.index)}→{max(w3s_daily.index)}")
 
-    # --- NEW: Pakse (013901) daily series: CSV ⊕ recent live ---
+    # Pakse (013901) daily series: CSV ⊕ recent live
     pakse_hist = _load_upstream_daily_csv(PAKSE_CSV)
 
     live_pakse = None
@@ -642,10 +1053,48 @@ def _load_service():
 
 # ----------------- Tab 1: Today → 7 Days -----------------
 def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (fast)", mc_samples=30):
+    """
+    Generate and plot the next 7-day absolute water-level forecast (UTC+07) with optional
+    uncertainty bands and upstream assists (Pakse, 3S).
+
+    Args:
+      show_uncertainty (bool):
+        Whether to include an uncertainty band on the forecast plot.
+        Defaults to False.
+      src_choice (str):
+        Uncertainty source selector.
+      mc_samples (int):
+        Number of stochastic forward passes when MC Dropout is used.
+        Typical range: 10–100.
+        Default: 30.
+
+    Returns:
+      Tuple[matplotlib.figure.Figure | None, str, pandas.DataFrame | None]:
+        - fig: The plot showing FNO mean forecast and any available overlays
+               (Pakse/3S corrections and uncertainty band). `None` if inputs are insufficient.
+        - note: A human-readable summary of data ranges, uncertainty source, and assist
+                availability (e.g., fitted lag k, usable days).
+        - df_out: A table with at least:
+            * date (Python `date`),
+            * h_pred (FNO absolute prediction).
+          If uncertainty is shown:
+            * p10, p90 (MC Dropout quantiles or ±1.96σ bounds).
+          If assists are available:
+            * h_pred_Pakse, pakse_used (bool mask),
+            * h_pred_3S,    s3_used    (bool mask).
+          `None` if window building or prediction failed.
+
+    Raises:
+      None.
+      All recoverable issues (e.g., insufficient contiguous data, window build failure) are
+      reported via a tuple `(None, "<message>", None)` rather than exceptions.
+    """
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
     resid_sigma = S.get("resid_sigma")
     mc_cache = S.get("mc_cache", {})
+    pakse_daily = S.get("pakse_daily")
+    w3s_daily = S.get("w3s_daily")
 
     # choose the last day of the most recent block with “≥ SEQ_LENGTH days” of continuity as the anchor (avoid tail-end gaps)
     if len(water_daily) < SEQ_LENGTH:
@@ -698,6 +1147,63 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
     # plot
     fig = plt.figure(figsize=(9.5, 4.2))
     plt.plot(fut_dates, y_abs, label="FNO (mean)", linewidth=2)
+
+    # ---- Pakse assist overlay (with guardrails) ----
+    pk_note = ""
+    try:
+        params_pk = _fit_pakse_params_for_tab1(runner, water_daily, pakse_daily, horizon_for_fit=1)
+    except Exception as _e:
+        params_pk = None
+
+    if params_pk:
+        y_pk, used_pk, avail_pk, k_pk = _apply_upstream_correction_future(
+            y_abs, fut_dates, pakse_daily, params_pk, shrink_dry=DRY_SHRINK, allow_interp=True
+        )
+        y_pk_plot = y_pk.copy()
+        y_pk_plot[~used_pk] = np.nan
+        if avail_pk > 0:
+            plt.plot(fut_dates, y_pk_plot, label=f"FNO + Pakse (k={k_pk}; avail={avail_pk}/{PRED_LENGTH})", linewidth=2)
+            try:
+                plt.plot(np.array(fut_dates, dtype="datetime64[ns]")[used_pk], y_pk[used_pk], "o", markersize=3)
+            except Exception:
+                pass
+            pk_note = (
+                f" | Pakse assist: k={k_pk}, avail={avail_pk}/{PRED_LENGTH}, "
+                f"source=recent~29d incl.today; dry-shrink λ={DRY_SHRINK}"
+            )
+        else:
+            pk_note = f" | Pakse not available for this window (k={k_pk}); source=recent~29d incl.today"
+    else:
+        pk_note = " | Pakse assist unavailable (insufficient data/fit)"
+
+    # ---- 3S assist overlay (with guardrails) ----
+    s3_note = ""
+    try:
+        params_3s = _fit_w3s_params_for_tab1(runner, water_daily, w3s_daily, horizon_for_fit=1)
+    except Exception as _e:
+        params_3s = None
+
+    if params_3s:
+        y_3s, used_3s, avail_3s, k_3s = _apply_upstream_correction_future(
+            y_abs, fut_dates, w3s_daily, params_3s, shrink_dry=DRY_SHRINK, allow_interp=True
+        )
+        y_3s_plot = y_3s.copy()
+        y_3s_plot[~used_3s] = np.nan
+        if avail_3s > 0:
+            plt.plot(fut_dates, y_3s_plot, label=f"FNO + 3S (k={k_3s}; avail={avail_3s}/{PRED_LENGTH})", linewidth=2)
+            try:
+                plt.plot(np.array(fut_dates, dtype="datetime64[ns]")[used_3s], y_3s[used_3s], "o", markersize=3)
+            except Exception:
+                pass
+            s3_note = (
+                f" | 3S assist: k={k_3s}, avail={avail_3s}/{PRED_LENGTH}, "
+                f"source=CSV⊕recent~29d incl.today; dry-shrink λ={DRY_SHRINK}"
+            )
+        else:
+            s3_note = f" | 3S not available for this window (k={k_3s}); source=CSV⊕recent~29d incl.today"
+    else:
+        s3_note = " | 3S assist unavailable (insufficient data/fit)"
+
     if lo is not None:
         plt.fill_between(fut_dates, lo, hi, alpha=0.18, label=band_note or "Uncertainty band")
     plt.title("Next 7-day absolute water level (UTC+07)")
@@ -709,14 +1215,36 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
     if lo is not None:
         df_out["p10"] = lo; df_out["p90"] = hi
 
+    # output the Pakse-corrected column and the availability flag
+    if params_pk:
+        # If params exist, the above y_pk/used_pk have been computed (otherwise pk_note will indicate unavailable/not fitted)
+        try:
+            df_out["h_pred_Pakse"] = y_pk
+            df_out["pakse_used"]   = used_pk
+        except Exception:
+            # If y_pk/used_pk are absent (e.g., fitting failed), skip
+            pass
+
+    # 3S-corrected column and availability flag
+    if params_3s:
+        try:
+            df_out["h_pred_3S"] = y_3s
+            df_out["s3_used"] = used_3s
+        except Exception:
+            pass
+
     note = "Next 7-day absolute water level (UTC+07)"
     if band_note:
         note += f"; Uncertainty: {band_note}"
+    note += (s3_note or "")
+    note += (pk_note or "")
     return fig, note, df_out
 
 # ----------------- Tab2：ΔRMSE Table -----------------
 def _load_phase_json_or_fallback():
-    """Prefer reading artifacts/phase_report.json; if missing, return None"""
+    """
+    Prefer reading artifacts/phase_report.json; if missing, return None
+    """
     if os.path.exists(PHASE_JSON):
         with open(PHASE_JSON, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -724,8 +1252,16 @@ def _load_phase_json_or_fallback():
 
 def ui_phase_table(scope):
     """
-    scope: 'Merged', 'Dry', 'Wet'
-    Return a DataFrame showing RMSE before/after alignment and ΔRMSE (based on 2024 test_applied)
+    Build a one-row summary table of phase-alignment results for a selected window.
+
+    Args:
+      scope (str): Window selector.
+
+    Returns:
+      pandas.DataFrame: Either
+        - A single-row table.
+        - Or, when the report file is unavailable, a single-row table with a "message"
+          column describing the missing artifact and how to generate it.
     """
     mapping = {"Merged":"all", "Dry":"dry", "Wet":"wet"}
     key = mapping.get(scope, "all")
@@ -745,8 +1281,22 @@ def ui_phase_table(scope):
 
 def ui_compare_fno_vs_3s_window(horizon=1):
     """
-    Compare FNO vs FNO+3S assist on dates where 3S data are available (with lag k) for a given horizon.
-    Returns a single-row DataFrame with RMSE/MAE for both methods within that window.
+    Compare baseline FNO vs. FNO + 3S upstream assist for a given forecasting horizon,
+    restricted to the date window where 3S data are actually available once shifted by
+    the fitted lag k. Computes RMSE and MAE for both methods on this intersected window,
+    and returns a one-row summary table.
+
+    Args:
+      horizon (int):
+        Forecast lead time in days ahead (k-day ahead) in [1, 7].
+
+    Returns:
+      pandas.DataFrame:
+        A one-row table with metrics over the "3S-available" window, or a single-column
+        message when the comparison cannot be performed.
+
+    Raises:
+      None. Errors and data insufficiency are reported via the returned message DataFrame.
     """
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
@@ -797,8 +1347,23 @@ def ui_compare_fno_vs_3s_window(horizon=1):
 
 def ui_compare_fno_vs_pakse_window(horizon=1):
     """
-    Compare FNO vs FNO+Pakse assist on dates where Pakse data are available (with lag k) for a given horizon.
-    Returns a single-row DataFrame with RMSE/MAE for both methods within that window.
+    Compare baseline FNO vs. FNO + Pakse (013901) upstream assist for a given forecasting
+    horizon, restricted to dates where Pakse data are available once shifted by the fitted
+    lag k. Computes RMSE and MAE for both methods on this intersected window and returns
+    a one-row summary table.
+
+    Args:
+      horizon (int):
+        Forecast lead time in days ahead (k-day ahead) in [1, 7].
+        Passed to the YTD backtest to extract k-day-ahead predictions.
+
+    Returns:
+      pandas.DataFrame:
+        A one-row table with metrics over the “Pakse-available” window, or a single-column
+        message when the comparison cannot be performed.
+
+    Raises:
+      None. Data insufficiency and other issues are reported via a message DataFrame.
     """
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
@@ -849,6 +1414,26 @@ def ui_compare_fno_vs_pakse_window(horizon=1):
 
 # ----------------- Gradio UI -----------------
 def build_app():
+    """
+    Build the Gradio UI for the Mekong (Stung Treng station) FNO demo.
+
+    The interface contains two tabs:
+      1) Forecast (Today → +7 days) — runs a 7-day absolute water-level forecast,
+         optionally shows uncertainty (historical residual band or MC Dropout), and overlays
+         upstream assists (3S / Pakse) when available.
+      2) Evaluation (2025 YTD & ΔRMSE) — runs a k-day-ahead backtest for 2025 YTD,
+         and compares FNO vs FNO+3S / FNO+Pakse on dates where upstream data exist.
+         Also displays a ΔRMSE table (from `artifacts/phase_report.json`) by window
+         (Merged/Dry/Wet).
+
+    Returns:
+      gr.Blocks:
+        A configured Gradio Blocks application.
+
+    Raises:
+      None. This builder wires components and callbacks only; heavy loading and
+      data access are performed inside the invoked callbacks.
+    """
     with gr.Blocks(title="Mekong FNO Demo", theme=gr.themes.Soft()) as demo:
         gr.Markdown("### Mekong Water Level Forecast (Stung Treng) — FNO\n- Tab1: **Forecast Today → +7 days** (optional uncertainty)\n- Tab2: **ΔRMSE alignment evaluation** (reads `artifacts/phase_report.json`)")
 
@@ -867,11 +1452,11 @@ def build_app():
                 btn.click(fn=ui_predict_today, inputs=[ck, src, samp], outputs=[out_plot, out_note, out_df])
 
             with gr.Tab("Evaluation (2025 YTD & ΔRMSE)"):
-                # --- shared horizon selector for backtest/compare ---
+                # shared horizon selector for backtest/compare
                 with gr.Row():
                     h_sel = gr.Slider(1, 7, value=1, step=1, label="Backtest horizon (days ahead)", interactive=True)
 
-                # --- YTD backtest (k-day ahead) ---
+                # YTD backtest (k-day ahead)
                 with gr.Row():
                     btn_bt = gr.Button("Run 2025 YTD backtest (k-day ahead)", variant="primary")
                 ytd_plot = gr.Plot()
@@ -892,7 +1477,7 @@ def build_app():
                 # automatically refresh once after the backtest completes
                 bt_evt.then(fn=ui_compare_fno_vs_3s_window, inputs=h_sel, outputs=cmp_tbl)
 
-                # --- NEW: FNO vs FNO+Pakse comparison within the Pakse-available window ---
+                # FNO vs FNO+Pakse comparison within the Pakse-available window
                 gr.Markdown("### FNO vs FNO + Pakse (Only where Pakse is available)")
                 with gr.Row():
                     btn_cmp_pk = gr.Button("Compare on Pakse-available dates (RMSE & MAE)", variant="secondary")
@@ -905,7 +1490,7 @@ def build_app():
 
                 gr.Markdown("---")
 
-                # --- ΔRMSE table ---
+                # ΔRMSE table
                 scope = gr.Radio(choices=["Merged", "Dry", "Wet"], value="Merged", label="Select window")
                 tbl = gr.Dataframe(interactive=False)
                 scope.change(fn=ui_phase_table, inputs=scope, outputs=tbl)

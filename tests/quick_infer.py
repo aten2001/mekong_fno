@@ -17,11 +17,19 @@ MINI_CSV     = "data-mini/water_level_sample.csv"
 
 def find_weights(path_or_dir: str) -> str:
     """
-    Return a path that can be passed directly to model.load_weights(...):
-    - If it’s a directory: prefer latest_checkpoint;
-    otherwise, find a *.ckpt.index file and strip .index to obtain the prefix
-    - If it’s a single H5 file: return it as is.
-    - If it’s a prefix string: check whether <prefix>.index exists.
+    Resolve a weight artifact path compatible with `model.load_weights()`.
+
+    Args:
+      path_or_dir: Directory containing checkpoints, a specific checkpoint
+        prefix (without extension), or an `.h5` weights file.
+
+    Returns:
+      str: A path/prefix that can be passed directly to
+        `tf.keras.Model.load_weights(...)`.
+
+    Raises:
+      FileNotFoundError: If the path cannot be resolved to a valid weights
+        artifact.
     """
     # Single H5 file
     if path_or_dir.lower().endswith(".h5"):
@@ -49,6 +57,23 @@ def find_weights(path_or_dir: str) -> str:
     )
 
 def main():
+    """
+    Run a quick 7-day inference using a minimal daily series.
+
+    Workflow:
+      1. Validate required files (`CLIM_PATH`, `NORM_PATH`, `MINI_CSV`).
+      2. Read `MINI_CSV` and convert to `water_daily` (index = python date → h).
+      3. Construct a `TenYearUnifiedRunner` for inference only.
+      4. Load climatology, normalization stats, and model weights.
+      5. Use the last date in the mini dataset as the anchor, predict the next
+         7 days of **absolute** water level.
+      6. Print target dates and values to stdout.
+
+    Raises:
+      FileNotFoundError: When any of `CLIM_PATH`, `NORM_PATH`, `MINI_CSV`, or
+        the weights artifact cannot be found.
+      ValueError: When the mini dataset length is less than `SEQ_LENGTH`.
+    """
     # 0) Existence checks
     for p in [CLIM_PATH, NORM_PATH, MINI_CSV]:
         if not os.path.exists(p):

@@ -5,6 +5,12 @@ from src.model_fno import SeasonalFNO1D
 from src.dataio import today_in_station_tz, doy_no_leap, doy_no_leap_vec
 
 def test_artifacts_exist_and_keys():
+    """
+    Verify presence of required artifacts and expected JSON structure.
+
+    Raises:
+      AssertionError: If any artifact is missing or required keys are absent.
+    """
     assert os.path.exists("artifacts/clim_vec.npy")
     assert os.path.exists("artifacts/norm_stats.json")
     assert os.path.exists("artifacts/phase_report.json")
@@ -13,6 +19,12 @@ def test_artifacts_exist_and_keys():
     assert "val" in rep and "test_applied" in rep
 
 def test_time_utils():
+    """
+    Validate time and DOY utilities (leap-day removed convention).
+
+    Raises:
+      AssertionError: If any invariant is violated.
+    """
     t = today_in_station_tz()
     assert isinstance(t, pd.Timestamp)
     assert t.hour == 0 and t.minute == 0 and t.tz is None
@@ -24,11 +36,30 @@ def test_time_utils():
     assert arr[0] == arr[1]
 
 def test_model_forward_shape():
+    """
+    Sanity check: SeasonalFNO1D forward pass returns (1, 7, 1).
+
+    Raises:
+      AssertionError: If the output shape is not `(1, 7, 1)`.
+    """
     model = SeasonalFNO1D(modes=64, width=96, num_layers=4, input_features=6)
     y = model(np.zeros((1,120,6), dtype=np.float32), training=False)
     assert y.shape == (1,7,1)
 
 def test_predict_api_with_mini_data():
+    """
+    Integration test: mini dataset → runner → weights → 7-day forecast.
+
+    Workflow:
+      1) Load `data-mini/water_level_sample.csv` and build `water_daily` (date→h).
+      2) Initialize `TenYearUnifiedRunner`, set climatology and `norm_stats`.
+      3) Build `SeasonalFNO1D`, resolve latest checkpoint (or fallback prefix), and load weights.
+      4) Use the last available day as `date_anchor`; call `predict_h_range(..., return_dates=True)`.
+      5) Assert 7 outputs and strictly ascending target dates.
+
+    Raises:
+      AssertionError: If forecast length != 7 or dates are not sorted.
+    """
     df = pd.read_csv("data-mini/water_level_sample.csv")
     df['Date'] = pd.to_datetime(df['Date']).dt.date
     water_daily = pd.Series(df['h'].values, index=df['Date'])

@@ -15,6 +15,19 @@ CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
 NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
 
 def _find_ckpt(weights_dir=W_DIR, fallback_prefix="stung_treng_fno.ckpt"):
+    """
+    Find a TensorFlow checkpoint under the weights directory.
+
+    Args:
+      weights_dir (str): Directory containing checkpoint files.
+      fallback_prefix: Filename prefix (without extension) to try as a last resort.
+
+    Returns:
+      str: Checkpoint prefix path (without ``.index`` suffix).
+
+    Raises:
+      FileNotFoundError: If no checkpoint can be resolved under ``weights_dir``.
+    """
     # 1) Prefer the latest checkpoint referenced by weights/checkpoint
     ckpt = tf.train.latest_checkpoint(weights_dir)
     if ckpt:
@@ -31,8 +44,17 @@ def _find_ckpt(weights_dir=W_DIR, fallback_prefix="stung_treng_fno.ckpt"):
 
 def _fno_predict7(model, Xn, tgt_dates, clim_vec, st):
     """
-    Xn: normalized (N, L, 6)
-    Return the 7th-day absolute water-level prediction (N,)
+    Predict day-7 absolute water level from normalized inputs.
+
+    Args:
+      model (tf.keras.Model): Trained ``tf.keras.Model`` (FNO).
+      Xn (np.ndarray): shape (N, L, 6). Normalized inputs.
+      tgt_dates (date.datetime): Sequence of pandas-compatible datetimes, one per sample.
+      clim_vec (np.ndarray): climatology vector indexed by DOY (no-leap indexing).
+      st (dict): dict with keys ``{'h_mean','h_std'}`` used for de-standardization.
+
+    Returns:
+      np.ndarray: Shape (N,), absolute WL prediction at horizon=7.
     """
     # Forward pass: standardized anomaly
     y_pred_n = model.predict(Xn, verbose=0)               # (N,7,1)
@@ -47,13 +69,34 @@ def _fno_predict7(model, Xn, tgt_dates, clim_vec, st):
     return y_abs[:, -1, 0]
 
 def _norm_inputs_like_train(X, st):
+    """Apply training-time normalization to input tensor.
+
+    Args:
+      X (np.ndarray): shape (N, L, C). Raw input features.
+      st (dict): dict with keys
+          ``{'t_mean','t_std','h_in_mean','h_in_std','dh_in_mean','dh_in_std'}``.
+
+    Returns:
+      np.ndarray: Normalized copy of ``X`` with the same shape.
+    """
     Xn = X.copy()
     Xn[:, :, 0] = (Xn[:, :, 0] - st['t_mean']) / (st['t_std'] + 1e-8)
     Xn[:, :, 2] = (Xn[:, :, 2] - st['h_in_mean']) / (st['h_in_std'] + 1e-8)
     Xn[:, :, 3] = (Xn[:, :, 3] - st['dh_in_mean']) / (st['dh_in_std'] + 1e-8)
     return Xn
 
-def _print_block(tag, yt, yp):
+def _print_block(tag, yt):
+    """
+    Create a pretty-print helper for a metrics row and print the header.
+
+    Args:
+      tag (str): window label (e.g., 'val_dry', 'tst_wet').
+      yt (np.ndarray): ground-truth day-7 series used for the header count.
+
+    Returns:
+      Callable[[str, np.ndarray, np.ndarray, pd.DatetimeIndex], None]:
+        A function ``row(name, y_true, y_pred, dates)`` that prints one line.
+    """
     print(f"\n[{tag}] n={len(yt)}")
     print("model   rmse   mae    nse    r      peak_dt")
     def row(name, a, b, dates):
@@ -61,6 +104,23 @@ def _print_block(tag, yt, yp):
     return row
 
 def main():
+    """Entry point for model-vs-baselines comparison on seasonal windows.
+
+    Workflow:
+      1) Load data (2015–2025) and build samples without season labels.
+      2) Restore climatology, normalization stats, and FNO weights.
+      3) Build four windows: {val_dry, val_wet, tst_dry, tst_wet}.
+      4) For each window, evaluate {FNO, Pers, Clim, Linear} on metrics:
+         RMSE, MAE, NSE, Pearson r, and peak timing error (days).
+      5) Compute 2024 weighted RMSE/MAE (dry/wet weighted by sample counts).
+      6) Save per-window results and weighted summaries to CSV/JSON.
+
+    Returns:
+      None. Exits with code 0 on success.
+
+    Raises:
+      FileNotFoundError: If model checkpoint cannot be found.
+    """
     # ===== 1) Load data and build samples =====
     runner = TenYearUnifiedRunner(csv_files_path=os.environ.get("CSV_DIR", "."), seq_length=120, pred_length=7)
     data = runner.load_range_data(2015, 2025, allow_missing_u=True)

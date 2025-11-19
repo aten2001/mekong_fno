@@ -3,6 +3,7 @@ import os, glob, json
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import pytest
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
@@ -11,11 +12,14 @@ from src.model_fno import SeasonalFNO1D
 
 def _find_ckpt(path="weights"):
     """
-    Return a path that can be passed directly to model.load_weights(...):
-    - If it’s a directory: prefer latest_checkpoint;
-    otherwise, find a *.ckpt.index file and strip .index to obtain the prefix
-    - If it’s a single H5 file: return it as is.
-    - If it’s a prefix string: check whether <prefix>.index exists.
+    Resolve a model-weights location into a loadable path for `model.load_weights()`.
+
+    Args:
+      path: Directory containing checkpoints, a checkpoint prefix (without extension),
+        or a single `.weights.h5` file. Defaults to `"weights"`.
+
+    Returns:
+      str: A path acceptable to `tf.keras.Model.load_weights(...)`.
     """
     if os.path.isdir(path):
         ckpt = tf.train.latest_checkpoint(path)
@@ -36,12 +40,28 @@ def _find_ckpt(path="weights"):
         pytest.skip(f"Checkpoint {path} not found")
 
 def test_import_and_shape():
+    """
+    Sanity-check model import and output tensor shape.
+    Builds a `SeasonalFNO1D` with expected hyperparameters, does a single
+    forward pass on a dummy batch, and asserts the output shape is `(1, 7, 1)`.
+
+    Raises:
+      AssertionError: If the returned tensor has an unexpected shape.
+    """
     model = SeasonalFNO1D(modes=64, width=96, num_layers=4, input_features=6)
     y = model(np.zeros((1, 120, 6), dtype=np.float32), training=False)
     assert y.shape == (1, 7, 1)
 
 def test_metrics_json_exist():
-    import pytest
+    """
+    Verify that phase/alignment report exists and has the expected top-level keys.
+    If `artifacts/phase_report.json` is missing, the test is skipped (helpful for
+    fresh environments). Otherwise, it asserts the presence of `"val"` and
+    `"test_applied"` sections.
+
+    Raises:
+      AssertionError: If the JSON structure is present but missing required keys.
+    """
     p = "artifacts/phase_report.json"
     if not os.path.exists(p):
         pytest.skip("Missing artifacts/phase_report.json (run training export first).")
@@ -49,7 +69,22 @@ def test_metrics_json_exist():
     assert "val" in rep and "test_applied" in rep
 
 def test_predict_with_mini_data():
-    import pytest
+    """
+    End-to-end smoke test: mini dataset → runner → load weights → 7-day forecast.
+
+    Workflow:
+      1) Check the presence of required artifacts: `clim_vec.npy`, `norm_stats.json`,
+         and a small CSV (`data-mini/water_level_sample.csv`). Skip if missing.
+      2) Build `water_daily` (pd.Series indexed by python `date` → float `h`).
+      3) Initialize `TenYearUnifiedRunner`, set climatology and normalization stats.
+      4) Build the model graph, resolve weights (ckpt prefix or `.weights.h5`), and load.
+      5) Use the last day in the mini dataset as the window end; predict next 7 days.
+      6) Assert that predictions are length 7, finite, and the returned dates are sorted.
+
+    Raises:
+      AssertionError: If predictions have wrong length, contain non-finite values,
+        or dates are not in ascending order.
+    """
     # File existence check
     need = ["artifacts/clim_vec.npy", "artifacts/norm_stats.json", "data-mini/water_level_sample.csv"]
     for p in need:

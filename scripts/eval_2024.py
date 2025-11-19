@@ -19,6 +19,18 @@ CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
 NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
 
 def _find_ckpt(weights_dir=WEIGHTS_DIR):
+    """
+    Find the latest TensorFlow checkpoint path under weights directory.
+
+    Args:
+      weights_dir (str): directory that contains TF checkpoint files.
+
+    Returns:
+      str: Absolute or relative path to the checkpoint prefix (without ``.index``).
+
+    Raises:
+      FileNotFoundError: If no checkpoint can be found in ``weights_dir``.
+    """
     ckpt = tf.train.latest_checkpoint(weights_dir)
     if ckpt: return ckpt
     idx = glob.glob(os.path.join(weights_dir, "*.ckpt.index"))
@@ -26,6 +38,16 @@ def _find_ckpt(weights_dir=WEIGHTS_DIR):
     raise FileNotFoundError("No TF checkpoint found in 'weights/'")
 
 def _norm_inputs_like_train(X, st):
+    """
+    Normalize input features using training-time statistics.
+
+    Args:
+      X (np.ndarray): shape (N, L, C). Raw input features.
+      st (dict): training stats.
+
+    Returns:
+      np.ndarray: Same shape as ``X``, normalized copy.
+    """
     Xn = X.copy()
     Xn[:, :, 0] = (Xn[:, :, 0] - st['t_mean']) / (st['t_std'] + 1e-8)
     Xn[:, :, 2] = (Xn[:, :, 2] - st['h_in_mean']) / (st['h_in_std'] + 1e-8)
@@ -33,6 +55,19 @@ def _norm_inputs_like_train(X, st):
     return Xn
 
 def _fno_predict7(model, Xn, dates, clim_vec, st):
+    """
+    Predict day-7 absolute water level from normalized inputs.
+
+    Args:
+      model (tf.keras.Model): the trained FNO model.
+      Xn (np.ndarray): shape (N, L, C). Normalized inputs.
+      dates (datetime.date): array-like of pandas-compatible datetimes, target dates (one per sample).
+      clim_vec (np.ndarray): shape (366,) or (365,), climatology indexed by DOY (no leap).
+      st (dict): de-standardization stats with keys {'h_mean','h_std'}.
+
+    Returns:
+      np.ndarray: shape (N,), absolute WL prediction for horizon=7 (day-7).
+    """
     from src.dataio import doy_no_leap_vec
     y_pred_n = model.predict(Xn, verbose=0)                # (N,7,1) standardized anomaly
     y_anom   = y_pred_n * st['h_std'] + st['h_mean']       # (N,7,1)
@@ -42,6 +77,17 @@ def _fno_predict7(model, Xn, dates, clim_vec, st):
     return y_abs[:, -1, 0]                                 # day-7
 
 def _split_indices(runner, tgt_dates):
+    """
+    Build validation/test 60-day window indices for dry/wet seasons.
+
+    Args:
+      runner (TenYearUnifiedRunner): provides year anchors and index utility.
+      tgt_dates: array-like of datetimes, target dates for which to build windows.
+
+    Returns:
+      dict[str, np.ndarray]: Mapping with keys
+        {'val_dry','val_wet','tst_dry','tst_wet'} to integer index arrays.
+    """
     td = pd.to_datetime(tgt_dates).normalize()
     yd = lambda y, m, d: runner._year_window_indices(td, y, m, d, length_days=60)
     return dict(
@@ -53,6 +99,27 @@ def _split_indices(runner, tgt_dates):
 
 # ====== full-year plot ======
 def _plot_year_all_models(X, Y, tgt_dates, model, st, clim_vec, year: int, lookback: int = 14, models_to_plot=None):
+    """
+    Plot a full-year day-7 curve for selected models and save the figure.
+
+    Args:
+      X (np.ndarray): shape (N, L, C). Raw inputs (not normalized).
+      Y (np.ndarray): shape (N, 7, 1). Ground-truth absolute WL for 7 horizons.
+      tgt_dates: array-like of datetimes, one per sample.
+      model (tf.keras.Model): trained FNO model.
+      st (dict): normalization/de-standardization stats (see ``_norm_inputs_like_train``).
+      clim_vec (np.ndarray): climatology vector indexed by DOY (no leap).
+      year (int): target calendar year to plot.
+      lookback (int): lookback length used by the linear baseline.
+      models_to_plot (Optional[Iterable[str]]): subset of lines to show, e.g.
+        {'truth','FNO','Pers','Clim','Linear'}. If None, plots all.
+
+    Returns:
+      None. Saves the PNG to the artifacts directory as a side-effect.
+
+    Raises:
+      ValueError: If input shapes are inconsistent (rare; not explicitly checked).
+    """
     td = pd.to_datetime(tgt_dates).normalize()
     idx = np.where(td.year == int(year))[0]
     if idx.size == 0:

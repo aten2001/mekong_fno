@@ -38,7 +38,6 @@ def build_climatology_from_train_years(data, train_years=(2015, 2022)) -> np.nda
 # train_with_dual_window_val / _denorm_pred_anom / evaluate_all / get_daily_h_df /
 # _series_true_pred7_by_idx / _rmse_with_shift / scan_best_shift / phase_vs_amplitude_report /
 # and the unified predict* interfaces below)
-
 class TenYearUnifiedRunner:
     def __init__(self, csv_files_path, seq_length=90, pred_length=7):
         self.csv_files_path = csv_files_path
@@ -59,13 +58,28 @@ class TenYearUnifiedRunner:
         self.clim = None  # np.ndarray, len=366, indices 1..365 valid
 
     def set_climatology(self, clim_vec: np.ndarray):
+        """Attach the climatology vector (len=366)."""
         assert isinstance(clim_vec, np.ndarray) and clim_vec.shape[0] == 366
         self.clim = clim_vec.astype(np.float32)
 
     # ---------- Load ~10 years of data with leap day removed ----------
     def load_range_data(self, start_year=2015, end_year=2024,
                         allow_missing_u=False, u_fill_strategy="ffill_then_mean"):
-        # print(f"加载 {self.station_info['name']} station {start_year}-{end_year} data...")
+        """
+        Load daily water level (and optional discharge) for a year range.
+        Reads MRC CSVs, aggregates to daily means, removes Feb-29, and
+        constructs chronological rows with placeholders.
+        If ``allow_missing_u=True``, fills ``u`` by forward-fill then mean.
+
+        Args:
+          start_year: Inclusive start year.
+          end_year: Inclusive end year.
+          allow_missing_u: Whether to tolerate missing discharge and fill it.
+          u_fill_strategy: Currently informational.
+
+        Returns:
+          list[list]: Rows ``[time_idx, x_pos, u, h, ts]`` in ascending date order.
+        """
         print(f"Loading station {self.station_info['name']} data for {start_year}-{end_year} ...")
         wl_file = f"{self.csv_files_path}/Water Level.ManualKH_{self.station_info['code']:06d}_{self.station_info['name']}.csv"
         q_file = f"{self.csv_files_path}/Discharge.Calculated daily dischargeKH_{self.station_info['code']:06d}_{self.station_info['name']}.csv"
@@ -136,9 +150,28 @@ class TenYearUnifiedRunner:
     # ---------- Helpers ----------
     @staticmethod
     def season_flag_from_month(month):
+        """
+        Map month to season flag.
+
+        Args:
+          month: Month as integer 1..12.
+
+        Returns:
+          int: 1 for wet season (May–Oct), else 0 for dry.
+        """
         return 1 if 5 <= month <= 10 else 0  # 1=wet, 0=dry
 
     def get_target_date(self, start_idx, data):
+        """
+        Compute the target date for a window starting at start_idx.
+
+        Args:
+          start_idx: Index of the first day of the input window in ``data``.
+          data: Same structure as returned by :meth:`load_range_data`.
+
+        Returns:
+          pandas.Timestamp: Target date = window end + ``pred_length`` days.
+        """
         target_idx = start_idx + self.seq_length + self.pred_length - 1
         if target_idx < len(data):
             return data[target_idx][4]
@@ -147,9 +180,19 @@ class TenYearUnifiedRunner:
 
     def prepare_sequences_no_season(self, data):
         """
-        Build input features:
-          [time_idx, x_pos/placeholder, h, dh1, doy_sin, doy_cos]  (6 channels)
-        Target y: [7,1] (h-only, multi-step). Here it returns absolute WL; training converts to anomaly.
+        Build input tensors (6 channels) and 7-step absolute targets.
+        Targets are absolute water levels for next 7 days; anomaly conversion is
+        applied later in training.
+
+        Args:
+          data: Rows ``[time_idx, x_pos, u, h, ts]`` in ascending date order.
+
+        Returns:
+          Tuple:
+            - X (np.ndarray): shape (N, L, 6), ``float32``.
+            - y (np.ndarray): shape (N, 7, 1), absolute ``float32``.
+            - tgt_seasons (np.ndarray): shape (N,), 1=wet else 0.
+            - tgt_dates (np.ndarray of pandas.Timestamp): shape (N,), target days.
         """
         X, y, tgt_dates = [], [], []
 
@@ -192,11 +235,35 @@ class TenYearUnifiedRunner:
     # ---------- Indexing by date range ----------
     @staticmethod
     def _mask_by_date_range(tgt_dates, start_date_str, length_days):
+        """
+        Boolean mask for a contiguous date window.
+
+        Args:
+          tgt_dates: Datetime-like array (normalized).
+          start_date_str: ISO string YYYY-MM-DD for window start.
+          length_days: Window length in days.
+
+        Returns:
+          np.ndarray: Boolean mask of same length as ``tgt_dates``.
+        """
         start = pd.to_datetime(start_date_str).normalize()
         end = start + pd.Timedelta(days=length_days - 1)
         return (tgt_dates >= start) & (tgt_dates <= end)
 
     def _year_window_indices(self, tgt_dates, year, m1, d1, length_days):
+        """
+        Indices for a year-specific window.
+
+        Args:
+          tgt_dates: Datetime-like array (normalized).
+          year: Integer target year.
+          m1: Start month.
+          d1: Start day.
+          length_days: Window length.
+
+        Returns:
+          np.ndarray: Indices (int) within the requested window.
+        """
         start_str = f"{year}-{int(m1):02d}-{int(d1):02d}"
         mask = self._mask_by_date_range(tgt_dates, start_str, length_days)
         return np.where(mask)[0]
@@ -205,8 +272,16 @@ class TenYearUnifiedRunner:
     @staticmethod
     def _norm_inputs(X, t_mean, t_std, h_in_mean, h_in_std, dh_in_mean, dh_in_std):
         """
-        Normalize channels: ch0(time_idx), ch2(h), ch3(dh1).
-        DOY channels ch4(ch5) remain unchanged in [-1,1].
+        Normalize channels ch0(time_idx), ch2(h), ch3(dh1).
+
+        Args:
+          X: Input array of shape (N, L, C).
+          t_mean, t_std: Mean/std for time_idx.
+          h_in_mean, h_in_std: Mean/std for input h.
+          dh_in_mean, dh_in_std: Mean/std for input dh1.
+
+        Returns:
+          np.ndarray: Same shape as ``X`` with normalized ch0/ch2/ch3.
         """
         Xn = X.copy()
         Xn[:, :, 0] = (Xn[:, :, 0] - t_mean) / (t_std + 1e-8)  # time_idx
@@ -219,6 +294,25 @@ class TenYearUnifiedRunner:
     def train_with_dual_window_val(self, X, y_abs, tgt_seasons, tgt_dates,
                                    epochs=300, batch_size=32,
                                    use_time_decay=True, tau_years=12.0):
+        """
+        Train FNO on standardized anomaly with dual-window validation.
+
+        Args:
+          X: Inputs (N, L, 6), absolute features.
+          y_abs: Targets (N, 7, 1), absolute water levels.
+          tgt_seasons: (N,) season flags for sampling weights.
+          tgt_dates: (N,) pandas-like target dates.
+          epochs: Max epochs.
+          batch_size: Batch size.
+          use_time_decay: Whether to downweight older samples exponentially.
+          tau_years: Time-decay parameter in years.
+
+        Returns:
+          tf.keras.callbacks.History: Training history with metrics/loss.
+
+        Raises:
+          AssertionError: If climatology was not set or norm stats missing.
+        """
         assert self.clim is not None, "Please call set_climatology(clim_vec) before training!"
 
         print("\n=== Build splits: train/val/test with dual seasonal windows ===")
@@ -375,9 +469,37 @@ class TenYearUnifiedRunner:
 
     # ---------- De-standardize predictions (anomaly space) ----------
     def _denorm_pred_anom(self, y_pred_n):  # y_pred_n: [N, 7, 1] (standardized)
+        """
+        De-standardize anomaly predictions.
+
+        Args:
+          y_pred_n: Standardized anomaly, shape (N, 7, 1).
+
+        Returns:
+          np.ndarray: De-standardized anomaly, shape (N, 7, 1).
+        """
         return y_pred_n * self.norm_stats['h_std'] + self.norm_stats['h_mean']
 
     def _eval_by_indices(self, idx, title):
+        """
+        Evaluate RMSE/MAE for a subset of samples.
+        Builds normalized inputs, runs model, converts to absolute by adding
+        target-day DOY climatology, and compares Day-7 to truth.
+
+        Args:
+          idx: Indices (1-D array-like) to evaluate.
+          title: Tag used in printed logs.
+
+        Returns:
+          dict: {
+            'y_true': np.ndarray[N],
+            'y_pred': np.ndarray[N],
+            'h_rmse': float,
+            'h_mae' : float,
+            'n'     : int,
+            'title' : str
+          }
+        """
         X, y_abs, tgt_dates = self.data_cache
         st = self.norm_stats
 
@@ -407,6 +529,14 @@ class TenYearUnifiedRunner:
                     n=len(idx), title=title)
 
     def evaluate_all(self):
+        """
+        Evaluate on validation (2023 dry/wet) and test (2024 dry/wet) windows.
+        Computes per-window RMSE/MAE and prints a weighted 2024 RMSE/MAE
+        (weight by sample count).
+
+        Returns:
+          dict: Keys {'val_dry','val_wet','tst_dry','tst_wet'}.
+        """
         print("\n=== Evaluation on validation (2023) and test (2024) windows ===")
         res = {}
         res['val_dry'] = self._eval_by_indices(self.idxs['val_dry'], "Val-dry (2023)")
@@ -432,9 +562,17 @@ class TenYearUnifiedRunner:
 
     def get_daily_h_df(self, year):
         """
-        Return a daily-aligned DataFrame for a given year:
-          columns: date, h_true (7th-day ground truth), h_pred (7th-day prediction)
-        Target-day definition matches training: window end + pred_length (7) days.
+        Return a daily-aligned DataFrame for a given year.
+        Uses the model to produce Day-7 absolute predictions on all target
+        dates in ``year``, aligned with the observed Day-7 ground truth.
+
+        Args:
+          year: Integer target year.
+
+        Returns:
+          pandas.DataFrame | None:
+            Columns ``['date','h_true','h_pred']`` sorted
+            by date, or ``None`` if the year has no samples.
         """
         X, Y_abs, tgt_dates = self.data_cache
         tgt_dates_ts = pd.to_datetime(tgt_dates).normalize()
@@ -467,10 +605,16 @@ class TenYearUnifiedRunner:
     # ---------- Utilities: series of (date, true-7th, pred-7th) for a set of indices ----------
     def _series_true_pred7_by_idx(self, idx: np.ndarray):
         """
-        Return (dates, y_true7, y_pred7) in ascending date order:
-        - dates: target day (window end + 7)
-        - y_true7: absolute ground truth
-        - y_pred7: absolute prediction (anomaly + climatology)
+        Return aligned (dates, truth, pred) series for Day-7.
+
+        Args:
+          idx: 1-D integer indices to extract.
+
+        Returns:
+          Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            - dates: numpy datetime64 array in ascending order.
+            - y_true7: float32 array of true Day-7 absolute WL.
+            - y_pred7: float32 array of predicted Day-7 absolute WL.
         """
         X, y_abs, tgt_dates = self.data_cache
         st = self.norm_stats
@@ -503,10 +647,15 @@ class TenYearUnifiedRunner:
     @staticmethod
     def _rmse_with_shift(y_true: np.ndarray, y_pred: np.ndarray, k: int):
         """
-        Convention:
-          k>0  -> shift prediction to the LEFT by k days (earlier),
-          k<0  -> shift prediction to the RIGHT by |k| days (later).
-        RMSE is computed over the overlapping region only; if overlap < 10, return (nan, 0).
+        RMSE under integer phase shift over the overlapping region.
+
+        Args:
+          y_true: Ground-truth array (N,).
+          y_pred: Prediction array (N,).
+          k: Integer shift.
+
+        Returns:
+          Tuple[float, int]: (rmse, overlap_length). If overlap < 10, returns (nan, 0).
         """
         y_true = np.asarray(y_true, dtype=np.float32)
         y_pred = np.asarray(y_pred, dtype=np.float32)
@@ -535,6 +684,22 @@ class TenYearUnifiedRunner:
 
     # ---------- Grid-search k ∈ [-K, K] to find best shift on a set of indices ----------
     def _scan_best_shift(self, idx: np.ndarray, K: int = 10, tag: str = ""):
+        """
+        Grid-search best integer phase shift in [-K, K].
+
+        Args:
+          idx: Indices to select a contiguous time series.
+          K: Maximum absolute shift to scan.
+          tag: Label for logging.
+
+        Returns:
+          dict: {
+            'best_k': int,
+            'best_rmse': float,
+            'base_rmse': float,
+            'gain': float  # base_rmse - best_rmse
+          }
+        """
         dates, yt, yp = self._series_true_pred7_by_idx(idx)
         if len(yt) == 0:
             print(f"{tag} contains no samples; skip phase scan.")
@@ -556,9 +721,21 @@ class TenYearUnifiedRunner:
     # ---------- Find k* on 2023 val windows, then fix k on 2024 test windows ----------
     def phase_vs_amplitude_report(self, K: int = 10):
         """
-        1) On 2023 (merged/dry/wet) windows, scan k ∈ [-K, K] to report best k and gain;
-        2) Apply those k* to corresponding 2024 windows and report aligned RMSEs;
-        3) Return a dict with all numbers.
+        Report phase alignment gains on 2023 windows and apply to 2024.
+
+        Workflow:
+        1) Scan k ∈ [-K, K] for 2023 (merged/dry/wet) and record best k, gain.
+        2) Apply those k* to 2024 (dry/wet and merged) and report before/after RMSE.
+        3) Return the aggregated report dict.
+
+        Args:
+          K: Maximum absolute shift to consider.
+
+        Returns:
+          dict: {
+            'val': {'all'|'dry'|'wet': {'best_k','best_rmse','base_rmse','gain'}},
+            'test_applied': {'all'|'dry'|'wet': {'k','rmse_before','rmse_after','gain'}}
+          }
         """
         ids = self.idxs  # Saved during the training function
         report = {"val": {}, "test_applied": {}}
@@ -596,7 +773,22 @@ class TenYearUnifiedRunner:
     def _build_window_for_date(self, water_daily: pd.Series,
                                discharge_daily: pd.Series | None,
                                date_anchor: pd.Timestamp):
-        """Build a length-L window [time_idx, x_pos, h, dh1, doy_sin, doy_cos] ending at date_anchor."""
+        """
+        Construct a length-L normalized input window ending at ``date_anchor``.
+        Collects daily values (skipping Feb 29 when needed), computes
+        ``dh1``, time indices, DOY sin/cos, and normalizes channels 0/2/3.
+
+        Args:
+          water_daily: Series (index=python date -> float meters).
+          discharge_daily: Unused placeholder for structure compatibility.
+          date_anchor: Inclusive window end date (normalized inside).
+
+        Returns:
+          np.ndarray: Shape (1, L, 6), normalized input features.
+
+        Raises:
+          ValueError: If any required day is missing from ``water_daily``.
+        """
         L = int(self.seq_length)
         end_date = pd.to_datetime(date_anchor).normalize()
         start_date = end_date - pd.Timedelta(days=L - 1)
@@ -647,13 +839,32 @@ class TenYearUnifiedRunner:
 
     def predict_h_on_date(self, water_daily: pd.Series, discharge_daily: pd.Series | None,
                           date_anchor: str | pd.Timestamp) -> float:
-        """Return absolute WL for target = (date_anchor + pred_length)."""
+        """
+        Predict absolute WL for the target day = date_anchor + pred_length.
+
+        Args:
+          water_daily: Daily series (index=python date -> float).
+          discharge_daily: Placeholder, not used.
+          date_anchor: Anchor date (string or Timestamp).
+
+        Returns:
+          float: Predicted absolute water level (meters) for Day-7 relative to anchor.
+        """
         date_anchor = pd.to_datetime(date_anchor).normalize()
         _, h_seq = self.predict_h_range(water_daily, discharge_daily, date_anchor, return_dates=True)
         return float(h_seq[-1])
 
     def predict_today_h(self, water_daily: pd.Series, discharge_daily: pd.Series | None = None) -> float:
-        """Return absolute WL for 'today + pred_length' in UTC+07."""
+        """
+        Predict absolute WL for 'today + pred_length' in station timezone (UTC+07).
+
+        Args:
+          water_daily: Daily series (index=python date -> float).
+          discharge_daily: Placeholder, not used.
+
+        Returns:
+          float: Predicted absolute water level (meters) for today+7.
+        """
         today = today_in_station_tz()
         return self.predict_h_on_date(water_daily, discharge_daily, today)
 
@@ -662,31 +873,32 @@ class TenYearUnifiedRunner:
                         return_dates: bool = False, clim_mode: str = "target7",
                         return_anomaly: bool = False):
         """
-        Return the entire 7-step ABSOLUTE WL sequence (shape [7]), consistent with training/evaluation.
+        Predict the full 7-step absolute WL sequence consistent with training/eval.
+        model → standardized anomaly (7) → de-standardize → add climatology.
 
-        Steps:
-          model -> standardized anomaly (7 steps) -> de-standardize anomaly ->
-          add back climatology by one of the modes (see below).
+        Climatology modes:
+          * ``"target7"`` (default): Add the DOY climatology of the 7th day to **all** 7 steps.
+            (Matches training/evaluation definition used across scripts.)
+          * ``"daywise"``: Add per-step DOY climatology (more physical but different from target7 definition).
 
-        Args
-        ----
-        water_daily : pd.Series
-            Index by date (prefer normalized) and value in meters.
-        discharge_daily : pd.Series | None
-            Optional; kept for structure (u is not used).
-        date_anchor : window end day (default = 'today' in UTC+07).
-        return_dates : if True, also return the 7 target dates.
-        clim_mode :
-            - "target7" (default): add the 7th-day DOY climatology to ALL 7 steps (matches training/eval).
-            - "daywise": add the DOY climatology for each step separately (more physical, differs from target def).
-        return_anomaly : if True, additionally return the 7-step anomaly prediction (without climatology).
+        Args:
+          water_daily: Series (index=python date -> float meters).
+          discharge_daily: Placeholder; not used.
+          date_anchor: Window end date. If None, uses station "today" (UTC+07).
+          return_dates: If True, also returns the 7 future dates.
+          clim_mode: Either ``"target7"`` or ``"daywise"``.
+          return_anomaly: If True, additionally return the anomaly sequence.
 
-        Returns
-        -------
-        If return_dates=False and return_anomaly=False:
-            np.ndarray shape (7,) — absolute WL sequence
-        If return_dates=True:
-            (dates(pd.DatetimeIndex[7]), h_abs(np.ndarray[7])) or (dates, h_abs, h_anom)
+        Returns:
+          Union[
+            np.ndarray,                                   # (7,)
+            Tuple[pd.DatetimeIndex, np.ndarray],          # if return_dates
+            Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]  # if return_dates and return_anomaly
+          ]
+
+        Raises:
+          AssertionError: If climatology or normalization stats are not set.
+          ValueError: If required daily values are missing for the input window.
         """
         assert self.clim is not None, "Complete set_climatology(clim_vec)！first"
         assert hasattr(self, "norm_stats"), "Complete training first to obtain norm_stats!"

@@ -4,6 +4,12 @@ from src.baselines import predict_persistence_7th, predict_climatology_7th, pred
 from src.metrics import rmse, mae, nse, pearson_r, peak_timing_error_days
 
 def test_metrics_small_arrays():
+    """
+    Verify core metric helpers on small, interpretable arrays.
+
+    Raises:
+      AssertionError: If any metric diverges from the expected closed-form values.
+    """
     yt = np.array([0., 1.])
     yp = np.array([0., 2.])
     assert np.isclose(rmse(yt, yp), np.sqrt(0.5))
@@ -22,6 +28,13 @@ def test_metrics_small_arrays():
     assert peak_timing_error_days(dates, yt, yp) == 3
 
 def test_baselines_shapes_and_values():
+    """
+    Validate baseline predictors' shapes and canonical behaviors.
+
+    Raises:
+      AssertionError: If any predictor returns wrong shape or deviates from the
+        expected values within a tight tolerance.
+    """
     # Construct simple sample: N = 2, L = 5, ch2 = h increasing
     X = np.zeros((2,5,6), dtype=np.float32)
     X[0,:,2] = [1,2,3,4,5]

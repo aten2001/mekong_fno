@@ -15,10 +15,23 @@ def fetch_recent_measurements(
     timeout: float = 10.0,
     headers: Optional[dict] = None,
 ) -> pd.DataFrame:
-    """
-    Pull recent minute/15-min observations from MRC API:
-    GET {base_url}/{station_code}
-    Returns a DataFrame with UTC timestamps and water levels.
+    """Fetch recent telemetry measurements from the MRC API.
+
+    Args:
+      station_code: MRC station code (e.g., ``"014501"``).
+      base_url: Base endpoint for the recent measurement API.
+      timeout: Request timeout in seconds.
+      headers: Optional extra HTTP headers to merge into the default headers.
+
+    Returns:
+      pandas.DataFrame: Columns:
+        - ``ts_utc`` (datetime64[ns, UTC]): Telemetry timestamp (UTC).
+        - ``w`` (float): Water level (meters). Non-numeric values coerced to NaN.
+        - ``r`` (float): Rainfall (mm). Non-numeric values coerced to NaN.
+
+    Raises:
+      requests.HTTPError: If the HTTP response status is an error.
+      requests.RequestException: For network/connection issues.
     """
     url = f"{base_url}/{station_code}"
     hdr = {"Accept": "application/json", "User-Agent": DEFAULT_UA}
@@ -45,9 +58,18 @@ def recent_to_daily_mean(
     min_samples_per_day: int = 24,
 ) -> pd.Series:
     """
-    Convert recent UTC observations to local-day (UTC+07) daily mean.
-    Filters out days with insufficient samples.
-    Returns: pd.Series indexed by python date -> float water level (m).
+    Aggregate recent UTC observations into local-day daily means.
+
+    Args:
+      df_recent: DataFrame from :func:`fetch_recent_measurements` containing
+        at least columns ``ts_utc`` (tz-aware UTC) and ``w`` (float).
+      tz: IANA timezone string for local-day aggregation.
+      min_samples_per_day: Minimum number of samples required to keep a day.
+
+    Returns:
+      pandas.Series: Daily mean water levels indexed by **python date** (not
+      Timestamp). Series is sorted ascending; dtype is ``float``. Empty series
+      if input is empty or no day meets the minimum sample count.
     """
     if df_recent is None or df_recent.empty:
         return pd.Series(dtype=float)
@@ -66,8 +88,18 @@ def merge_into_water_daily(
     recent_daily: pd.Series,
 ) -> pd.Series:
     """
-    Merge recent daily means into existing water_daily (prefer recent values).
-    Both indices must be python date objects.
+    Merge recent daily means into an existing daily series.
+
+    Args:
+      water_daily: Historical baseline Series (index: python ``date`` → float).
+      recent_daily: Recent daily means to merge (index: python ``date`` → float).
+
+    Returns:
+      pandas.Series: Merged, sorted daily series (index: python ``date`` → float).
+      If ``recent_daily`` is empty/None, returns ``water_daily`` unchanged.
+
+    Raises:
+      ValueError: If either input cannot be cast to ``float`` values.
     """
     if recent_daily is None or recent_daily.empty:
         return water_daily
@@ -83,7 +115,17 @@ def get_recent_daily_cached(
     base_url: str = DEFAULT_BASE,
 ) -> pd.Series:
     """
-    Load recent daily means from cache if fresh; otherwise fetch & refresh cache.
+    Return recent daily means using a small on-disk cache.
+
+    Args:
+      station_code: MRC station code to query.
+      cache_path: JSON cache file path (created if missing).
+      ttl_seconds: Cache time-to-live in seconds.
+      base_url: Base endpoint for the MRC recent measurement API.
+
+    Returns:
+      pandas.Series: Daily mean water levels (index: python ``date`` → float).
+      Empty series if the API returns no usable data.
     """
     now = time.time()
     # read cache
