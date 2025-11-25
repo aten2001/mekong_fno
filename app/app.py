@@ -890,13 +890,15 @@ def ui_eval_ytd(horizon=1):
 # ----------------- run time Singleton Cache (avoid repeated loading) -----------------
 _APP_CACHE = dict()
 
-def _load_service():
+def _load_service(force_reload: bool = False):
     """
     Initialize and cache the end-to-end inference “service” (model, data, and upstream series).
     Results are stored in a process-level singleton cache so subsequent calls are O(1).
 
     Args:
-      None
+      force_reload (bool, optional):
+        If False (default), reuse the in-memory cache when already initialized.
+        If True, clear the cache and rebuild everything (CSV/backfill/live, model, etc.).
 
     Returns:
       dict: A singleton dictionary containing:
@@ -909,16 +911,18 @@ def _load_service():
         - **w3s_daily** (`pandas.Series | None`): 3S station daily means after merge.
         - **pakse_daily** (`pandas.Series | None`): Pakse station daily means after merge.
         - **ready** (`bool`): Flag indicating the cache has been fully initialized.
-
-    Raises:
-      None. All external I/O is wrapped in `try/except` with diagnostics printed to stdout.
-      On failure to locate a TF checkpoint, `_find_ckpt()` will raise `FileNotFoundError`.
     """
-    if _APP_CACHE.get("ready"):
+    # if the cache already initialized and force_reload is False, then reuse it.
+    if _APP_CACHE.get("ready") and not force_reload:
         return _APP_CACHE
+
+    # force reload
+    _APP_CACHE.clear()
+
     t0 = time.perf_counter()
     runner = TenYearUnifiedRunner(CSV_DIR, seq_length=SEQ_LENGTH, pred_length=PRED_LENGTH)
     data = runner.load_range_data(2015, 2025, allow_missing_u=True)
+
     # build clim & norm
     runner.set_climatology(np.load(CLIM_PATH))
     st = json.load(open(NORM_PATH, "r", encoding="utf-8"))
@@ -1412,6 +1416,34 @@ def ui_compare_fno_vs_pakse_window(horizon=1):
         "ΔMAE":              round(mae_pk - mae_fno, 3),
     }])
 
+def ui_reload_service():
+    """
+    Gradio callback: force reload model & data into the process-level cache.
+
+    Returns:
+      str: A human-readable status line showing reload time and latest available date.
+    """
+    t0 = time.perf_counter()
+
+    # force reload
+    S = _load_service(force_reload=True)
+    S = _load_service(force_reload=True)
+
+    water_daily = S.get("water_daily")
+    try:
+        last_day = max(water_daily.index) if water_daily is not None and len(water_daily) > 0 else None
+    except Exception:
+        last_day = None
+
+    now = pd.Timestamp.now(tz=ZoneInfo("Asia/Bangkok"))
+    dt_str = now.strftime("%Y-%m-%d %H:%M")
+
+    msg = f"Reloaded at {dt_str} (UTC+07); latest water_daily date = {last_day}"
+    elapsed = time.perf_counter() - t0
+    msg += f" | reload took {elapsed:.2f} s"
+
+    return msg
+
 # ----------------- Gradio UI -----------------
 def build_app():
     """
@@ -1435,22 +1467,38 @@ def build_app():
       data access are performed inside the invoked callbacks.
     """
     with gr.Blocks(title="Mekong FNO Demo", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("### Mekong Water Level Forecast (Stung Treng) — FNO\n- Tab1: **Forecast Today → +7 days** (optional uncertainty)\n- Tab2: **ΔRMSE alignment evaluation** (reads `artifacts/phase_report.json`)")
+        gr.Markdown(
+            "### Mekong Water Level Forecast (Stung Treng) — FNO\n"
+            "- Tab1: **Forecast Today → +7 days** (optional uncertainty)\n"
+            "- Tab2: **ΔRMSE alignment evaluation** (reads `artifacts/phase_report.json`)"
+        )
+
+        # === global reload for Tab1 and Tab2 ===
+        with gr.Row():
+            reload_btn = gr.Button("Reload data/model", variant="secondary")
+            reload_note = gr.Markdown()
+        reload_btn.click(fn=ui_reload_service, inputs=None, outputs=reload_note)
 
         with gr.Tabs():
+            # ----------------- Tab 1: Forecast -----------------
             with gr.Tab("Forecast (Today → +7 days)"):
                 with gr.Row():
                     btn = gr.Button("Forecast +7 Days (UTC+07)", variant="primary")
                     ck = gr.Checkbox(value=False, label="Show uncertainty (Residuals/MC)")
-                    src = gr.Radio(choices=["Historical residuals (fast)", "MC Dropout (slow)"],
-                                   value="Historical residuals (fast)", label="Uncertainty source")
+                    src = gr.Radio(
+                        choices=["Historical residuals (fast)", "MC Dropout (slow)"],
+                        value="Historical residuals (fast)",
+                        label="Uncertainty source",
+                    )
                     samp = gr.Slider(10, 100, value=30, step=5, label="MC samples", interactive=True)
+
                 out_plot = gr.Plot()
                 out_note = gr.Markdown()
-                out_df   = gr.Dataframe(headers=["date","h_pred","p10","p90"], interactive=False)
+                out_df = gr.Dataframe(headers=["date", "h_pred", "p10", "p90"], interactive=False)
 
                 btn.click(fn=ui_predict_today, inputs=[ck, src, samp], outputs=[out_plot, out_note, out_df])
 
+            # ----------------- Tab 2: Evaluation -----------------
             with gr.Tab("Evaluation (2025 YTD & ΔRMSE)"):
                 # shared horizon selector for backtest/compare
                 with gr.Row():
