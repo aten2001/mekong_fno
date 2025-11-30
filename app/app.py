@@ -1466,7 +1466,7 @@ def build_app():
       None. This builder wires components and callbacks only; heavy loading and
       data access are performed inside the invoked callbacks.
     """
-    with gr.Blocks(title="Mekong FNO Demo", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Mekong FNO Demo") as demo:
         gr.Markdown(
             "### Mekong Water Level Forecast (Stung Treng) — FNO\n"
             "- Tab1: **Forecast Today → +7 days** (optional uncertainty)\n"
@@ -1552,4 +1552,7 @@ if __name__ == "__main__":
     # warm-up (reduce latency for load model and data for the first time)
     _load_service()
     app = build_app()
-    app.launch(server_name="0.0.0.0", server_port=7860)
+    app.launch(server_name="0.0.0.0",
+               server_port=7860,
+               theme=gr.themes.Soft(),
+               )

@@ -4,7 +4,7 @@ emoji: 🌊
 colorFrom: indigo
 colorTo: green
 sdk: gradio
-sdk_version: 3.50.2
+sdk_version: 6.0.1
 app_file: app/app.py
 python_version: "3.10"
 pinned: false
