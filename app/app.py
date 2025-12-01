@@ -1173,10 +1173,10 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
                 pass
             pk_note = (
                 f" | Pakse assist: k={k_pk}, avail={avail_pk}/{PRED_LENGTH}, "
-                f"source=recent~29d incl.today; dry-shrink λ={DRY_SHRINK}"
+                f"source=recent\\~29d incl.today; dry-shrink λ={DRY_SHRINK}"
             )
         else:
-            pk_note = f" | Pakse not available for this window (k={k_pk}); source=recent~29d incl.today"
+            pk_note = f" | Pakse not available for this window (k={k_pk}); source=recent\\~29d incl.today"
     else:
         pk_note = " | Pakse assist unavailable (insufficient data/fit)"
 
@@ -1201,10 +1201,10 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
                 pass
             s3_note = (
                 f" | 3S assist: k={k_3s}, avail={avail_3s}/{PRED_LENGTH}, "
-                f"source=CSV⊕recent~29d incl.today; dry-shrink λ={DRY_SHRINK}"
+                f"source=CSV⊕recent\\~29d incl.today; dry-shrink λ={DRY_SHRINK}"
             )
         else:
-            s3_note = f" | 3S not available for this window (k={k_3s}); source=CSV⊕recent~29d incl.today"
+            s3_note = f" | 3S not available for this window (k={k_3s}); source=CSV⊕recent\\~29d incl.today"
     else:
         s3_note = " | 3S assist unavailable (insufficient data/fit)"
 
