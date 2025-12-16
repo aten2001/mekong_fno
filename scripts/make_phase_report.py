@@ -6,7 +6,7 @@ import tensorflow as tf
 
 from src.runner import TenYearUnifiedRunner
 from src.model_fno import SeasonalFNO1D
-from src.dataio import doy_no_leap_vec
+from src.time_features import doy_no_leap_vec
 
 ART_DIR = "artifacts"
 SEQ_LENGTH, PRED_LENGTH = 120, 7

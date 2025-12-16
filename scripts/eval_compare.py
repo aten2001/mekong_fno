@@ -62,7 +62,7 @@ def _fno_predict7(model, Xn, tgt_dates, clim_vec, st):
     y_pred_anom = y_pred_n * st['h_std'] + st['h_mean']   # (N,7,1)
     # Add back the target-day (7th) DOY climatology baseline
     # (consistent with the training/evaluation definition)
-    from src.dataio import doy_no_leap_vec
+    from src.time_features import doy_no_leap_vec
     tgt_doy = doy_no_leap_vec(pd.to_datetime(tgt_dates))
     clim_add = clim_vec[tgt_doy][:, None, None]           # (N,1,1)
     y_abs = y_pred_anom + clim_add                        # (N,7,1)

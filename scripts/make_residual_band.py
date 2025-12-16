@@ -109,7 +109,7 @@ def _predict_7_abs_target7(model, Xn, dates, clim_vec, st):
       Uses ``doy_no_leap_vec`` (no-leap DOY) to match training behavior (skips Feb 29).
       This “target7 climatology for all steps” matches the app’s visualization logic.
     """
-    from src.dataio import doy_no_leap_vec
+    from src.time_features import doy_no_leap_vec
     y_pred_n = model.predict(Xn, verbose=0)          # (N,7,1) standardized anomaly
     y_anom   = (y_pred_n * st['h_std'] + st['h_mean'])[:, :, 0]  # (N,7)
     tgt_doy  = doy_no_leap_vec(pd.to_datetime(dates))            # (N,)

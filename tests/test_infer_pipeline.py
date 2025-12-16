@@ -2,7 +2,7 @@
 import os, json, numpy as np, pandas as pd
 from src.runner import TenYearUnifiedRunner
 from src.model_fno import SeasonalFNO1D
-from src.dataio import today_in_station_tz, doy_no_leap, doy_no_leap_vec
+from src.time_features import today_in_station_tz, doy_no_leap, doy_no_leap_vec
 
 def test_artifacts_exist_and_keys():
     """

@@ -1,6 +1,6 @@
 # src/baselines.py
 import numpy as np
-from .dataio import doy_no_leap_vec
+from .time_features import doy_no_leap_vec
 
 def _to_1d(a):
     """Return a 1-D view of the input as a NumPy array."""

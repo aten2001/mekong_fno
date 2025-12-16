@@ -2,7 +2,7 @@
 import numpy as np, pandas as pd, tensorflow as tf
 from datetime import timedelta
 from .model_fno import SeasonalFNO1D
-from .dataio import today_in_station_tz, doy_no_leap, doy_no_leap_vec, doy_sin_cos_series
+from .time_features import today_in_station_tz, doy_no_leap, doy_no_leap_vec, doy_sin_cos_series
 
 # ============ Daily climatology (computed from training years) ============
 def build_climatology_from_train_years(data, train_years=(2015, 2022)) -> np.ndarray:
