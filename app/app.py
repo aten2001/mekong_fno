@@ -1427,7 +1427,6 @@ def ui_reload_service():
 
     # force reload
     S = _load_service(force_reload=True)
-    S = _load_service(force_reload=True)
 
     water_daily = S.get("water_daily")
     try:

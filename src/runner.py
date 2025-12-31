@@ -11,7 +11,7 @@ def build_climatology_from_train_years(data, train_years=(2015, 2022)) -> np.nda
 
     Args:
         data: list from load_range_data -> [time_idx, x_pos, u, h, ts]
-        train_years: (start_year, end_year) inclusive
+        train_years: (start_year, end_year) inclusive of both endpoints
 
     Returns:
         float32 vector of length 366 where indices 1..365 are valid (index 0 is padding with 0.0).
@@ -34,11 +34,25 @@ def build_climatology_from_train_years(data, train_years=(2015, 2022)) -> np.nda
     clim_vec[1:366] = clim_full.values.astype(np.float32)
     return clim_vec
 
-# - TenYearUnifiedRunner (includes: load_range_data / prepare_sequences_no_season / _norm_inputs /
-# train_with_dual_window_val / _denorm_pred_anom / evaluate_all / get_daily_h_df /
-# _series_true_pred7_by_idx / _rmse_with_shift / scan_best_shift / phase_vs_amplitude_report /
-# and the unified predict* interfaces below)
 class TenYearUnifiedRunner:
+    """
+    The end-to-end workflow for 10-year water-level forecasting:
+    data loading, feature building, normalization, training/validation, evaluation, and inference.
+
+    Public API:
+      - load_range_data(...)
+      - prepare_sequences_no_season(...)
+      - train_with_dual_window_val(...)
+      - evaluate_all()
+      - get_daily_h_df(year)
+      - predict_h_on_date(...), predict_today_h(...), predict_h_range(...)
+      - phase_vs_amplitude_report(K=10)
+
+    Notes:
+      - Targets are trained in anomaly space (relative to DOY climatology) and converted back during eval/inference.
+      - Helper methods prefixed with '_' are internal and not part of the stable API.
+    """
+
     def __init__(self, csv_files_path, seq_length=90, pred_length=7):
         self.csv_files_path = csv_files_path
         self.seq_length = seq_length
