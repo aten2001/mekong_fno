@@ -1,19 +1,26 @@
 # scripts/make_residual_band.py
-import os, json, glob
+import os, sys, json, glob
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 
+# --- make paths stable regardless of current working directory ---
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from src.runner import TenYearUnifiedRunner
 from src.model_fno import SeasonalFNO1D
 
-ART_DIR = "artifacts"
+ASSETS_DIR = Path(os.environ.get("ASSETS_DIR", str(REPO_ROOT / "assets")))
 SEQ_LENGTH, PRED_LENGTH = 120, 7
-CSV_DIR = os.environ.get("CSV_DIR", "data")
-CLIM_PATH = os.path.join(ART_DIR, "clim_vec.npy")
-NORM_PATH = os.path.join(ART_DIR, "norm_stats.json")
-WEIGHTS_DIR = "weights"
-OUT_PATH = os.path.join(ART_DIR, "residual_sigma.json")
+CSV_DIR = os.environ.get("CSV_DIR", str(REPO_ROOT / "data"))
+CLIM_PATH = ASSETS_DIR / "clim_vec.npy"
+NORM_PATH = ASSETS_DIR / "norm_stats.json"
+WEIGHTS_DIR = Path(os.environ.get("WEIGHTS_DIR", str(REPO_ROOT / "weights")))
+OUT_PATH = ASSETS_DIR / "residual_sigma.json"
 
 def _find_ckpt():
     """
@@ -25,11 +32,11 @@ def _find_ckpt():
     Raises:
       FileNotFoundError: If no checkpoint exists under ``WEIGHTS_DIR``.
     """
-    ckpt = tf.train.latest_checkpoint(WEIGHTS_DIR)
+    ckpt = tf.train.latest_checkpoint(str(WEIGHTS_DIR))
     if ckpt: return ckpt
-    idx = glob.glob(os.path.join(WEIGHTS_DIR, "*.ckpt.index"))
+    idx = glob.glob(str(WEIGHTS_DIR / "*.ckpt.index"))
     if idx:  return idx[0].replace(".index","")
-    raise FileNotFoundError("No TF checkpoint in 'weights/'")
+    raise FileNotFoundError(f"No TF checkpoint in: {WEIGHTS_DIR}")
 
 def _norm_inputs_like_train(X, st):
     """Apply training-time normalization to inputs.
@@ -128,7 +135,7 @@ def main():
       5) Compute residuals ``(y_true_abs - y_pred_abs)`` and estimate:
          - ``by_horizon``: std across samples for each horizon (length 7).
          - ``overall``: std across all horizons and samples.
-      6) Save to ``artifacts/residual_sigma.json`` with sample count and a short note.
+      6) Save to ``assets/residual_sigma.json`` with sample count and a short note.
 
     Returns:
       None
@@ -136,12 +143,17 @@ def main():
     Raises:
       FileNotFoundError: If no TensorFlow checkpoint can be found under ``WEIGHTS_DIR``.
     """
+    if not CLIM_PATH.exists():
+        raise FileNotFoundError(f"Missing climatology file: {CLIM_PATH}")
+    if not NORM_PATH.exists():
+        raise FileNotFoundError(f"Missing norm stats file: {NORM_PATH}")
+
     runner = TenYearUnifiedRunner(CSV_DIR, seq_length=SEQ_LENGTH, pred_length=PRED_LENGTH)
     data = runner.load_range_data(2015, 2025, allow_missing_u=True)
     X, Y_abs, _, tgt_dates = runner.prepare_sequences_no_season(data)
 
-    clim = np.load(CLIM_PATH)
-    st = json.load(open(NORM_PATH, "r", encoding="utf-8"))
+    clim = np.load(str(CLIM_PATH))
+    st = json.load(open(str(NORM_PATH), "r", encoding="utf-8"))
     model = SeasonalFNO1D(modes=64, width=96, num_layers=4, input_features=X.shape[2], dropout_rate=0.1, l2=1e-5)
     _ = model(np.zeros((1, SEQ_LENGTH, X.shape[2]), dtype=np.float32), training=False)
     model.load_weights(_find_ckpt())
@@ -159,15 +171,15 @@ def main():
     sigma_step = np.std(resid, axis=0, ddof=1).astype(float).tolist()
     sigma_all  = float(np.std(resid, ddof=1))
 
-    os.makedirs(ART_DIR, exist_ok=True)
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
     out = dict(
         by_horizon=sigma_step,
         overall=sigma_all,
         n=int(len(idx_all)),
         note="std of residuals using 2023(val_all)+2024(dry,wet); target7 climatology mode"
     )
-    json.dump(out, open(OUT_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    print("Saved:", OUT_PATH, "\nσ_step:", sigma_step, "overall:", sigma_all)
+    json.dump(out, open(str(OUT_PATH), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    print("Saved:", str(OUT_PATH), "\nσ_step:", sigma_step, "overall:", sigma_all)
 
 if __name__ == "__main__":
     main()

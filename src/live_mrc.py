@@ -110,7 +110,7 @@ def merge_into_water_daily(
 # -------- tiny file cache to avoid hammering the API --------
 def get_recent_daily_cached(
     station_code: str = "014501",
-    cache_path: str = "artifacts/live_recent_daily.json",
+    cache_path: Optional[str] = None,
     ttl_seconds: int = 900,
     base_url: str = DEFAULT_BASE,
 ) -> pd.Series:

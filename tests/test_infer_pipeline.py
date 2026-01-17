@@ -11,11 +11,11 @@ def test_artifacts_exist_and_keys():
     Raises:
       AssertionError: If any artifact is missing or required keys are absent.
     """
-    assert os.path.exists("artifacts/clim_vec.npy")
-    assert os.path.exists("artifacts/norm_stats.json")
-    assert os.path.exists("artifacts/phase_report.json")
+    assert os.path.exists("assets/clim_vec.npy")
+    assert os.path.exists("assets/norm_stats.json")
+    assert os.path.exists("assets/phase_report.json")
     assert os.path.exists("weights")
-    rep = json.load(open("artifacts/phase_report.json","r",encoding="utf-8"))
+    rep = json.load(open("assets/phase_report.json","r",encoding="utf-8"))
     assert "val" in rep and "test_applied" in rep
 
 def test_time_utils():
@@ -65,8 +65,8 @@ def test_predict_api_with_mini_data():
     water_daily = pd.Series(df['h'].values, index=df['Date'])
 
     runner = TenYearUnifiedRunner(csv_files_path=".", seq_length=120, pred_length=7)
-    clim = np.load("artifacts/clim_vec.npy"); runner.set_climatology(clim)
-    runner.norm_stats = json.load(open("artifacts/norm_stats.json","r",encoding="utf-8"))
+    clim = np.load("assets/clim_vec.npy"); runner.set_climatology(clim)
+    runner.norm_stats = json.load(open("assets/norm_stats.json","r",encoding="utf-8"))
     model = SeasonalFNO1D(modes=64, width=96, num_layers=4, input_features=6)
     _ = model(np.zeros((1,120,6), dtype=np.float32), training=False)
     # allow using the latest checkpoint

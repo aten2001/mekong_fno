@@ -3,16 +3,17 @@ import os
 from typing import Optional
 import pandas as pd
 
-BACKFILL_PATH = os.path.join("artifacts", "live_backfill.parquet")
-
 def _ensure_parent_dir(path: str):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
 def series_from_any(obj) -> Optional[pd.Series]:
     """
-    normalize DataFrame/Series/None into a Series (index = Python date, value = float);
-    do not change the daily bucketing/aggregation
-    allow column names ['date','h'] or ['ts','h'/'w']
+    Normalize DataFrame/Series/None into a Series:
+      - index = Python date
+      - value = float
+    Accept columns:
+      - ['date','h'] or ['date','w']
+      - ['ts','h']   or ['ts','w']
     """
     if obj is None:
         return None
@@ -34,12 +35,16 @@ def series_from_any(obj) -> Optional[pd.Series]:
             return s.sort_index()
     return None
 
-def read_backfill(path: str = BACKFILL_PATH) -> Optional[pd.Series]:
+
+def read_backfill(path: str) -> Optional[pd.Series]:
     """
-    read the backfill Parquet file as a Series (index = Python date, value = float)
+    Read the backfill Parquet file as a Series (index = Python date, value = float)
     """
+    if not path:
+        raise ValueError("read_backfill(path): path is required")
     if not os.path.exists(path):
         return None
+
     try:
         df = pd.read_parquet(path)
         if "date" in df.columns and "h" in df.columns:
@@ -47,6 +52,8 @@ def read_backfill(path: str = BACKFILL_PATH) -> Optional[pd.Series]:
                 df["h"].astype(float).values,
                 index=pd.to_datetime(df["date"]).dt.date
             ).sort_index()
+
+        # fallback: single-column parquet
         if df.shape[1] == 1:
             s = df.iloc[:, 0]
             return pd.Series(
@@ -55,14 +62,19 @@ def read_backfill(path: str = BACKFILL_PATH) -> Optional[pd.Series]:
             ).sort_index()
     except Exception:
         return None
+
     return None
 
-def write_backfill(s: pd.Series, path: str = BACKFILL_PATH) -> None:
+
+def write_backfill(s: pd.Series, path: str) -> None:
     """
-    write the Series (index = Python date, value = float) back to Parquet
+    Write the Series (index = Python date, value = float) back to Parquet.
     """
+    if not path:
+        raise ValueError("write_backfill(s, path): path is required")
     if s is None or len(s) == 0:
         return
+
     _ensure_parent_dir(path)
     df = pd.DataFrame({"date": pd.to_datetime(list(s.index)), "h": s.values})
     df.to_parquet(path, index=False)

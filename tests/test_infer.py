@@ -55,16 +55,16 @@ def test_import_and_shape():
 def test_metrics_json_exist():
     """
     Verify that phase/alignment report exists and has the expected top-level keys.
-    If `artifacts/phase_report.json` is missing, the test is skipped (helpful for
+    If `assets/phase_report.json` is missing, the test is skipped (helpful for
     fresh environments). Otherwise, it asserts the presence of `"val"` and
     `"test_applied"` sections.
 
     Raises:
       AssertionError: If the JSON structure is present but missing required keys.
     """
-    p = "artifacts/phase_report.json"
+    p = "assets/phase_report.json"
     if not os.path.exists(p):
-        pytest.skip("Missing artifacts/phase_report.json (run training export first).")
+        pytest.skip("Missing assets/phase_report.json (run training export first).")
     rep = json.load(open(p, "r", encoding="utf-8"))
     assert "val" in rep and "test_applied" in rep
 
@@ -73,7 +73,7 @@ def test_predict_with_mini_data():
     End-to-end smoke test: mini dataset → runner → load weights → 7-day forecast.
 
     Workflow:
-      1) Check the presence of required artifacts: `clim_vec.npy`, `norm_stats.json`,
+      1) Check the presence of required assets: `clim_vec.npy`, `norm_stats.json`,
          and a small CSV (`data-mini/water_level_sample.csv`). Skip if missing.
       2) Build `water_daily` (pd.Series indexed by python `date` → float `h`).
       3) Initialize `TenYearUnifiedRunner`, set climatology and normalization stats.
@@ -86,7 +86,7 @@ def test_predict_with_mini_data():
         or dates are not in ascending order.
     """
     # File existence check
-    need = ["artifacts/clim_vec.npy", "artifacts/norm_stats.json", "data-mini/water_level_sample.csv"]
+    need = ["assets/clim_vec.npy", "assets/norm_stats.json", "data-mini/water_level_sample.csv"]
     for p in need:
         if not os.path.exists(p):
             pytest.skip(f"Missing {p}. Run scripts/make_data_mini.py and scripts/train_export.py.")
@@ -98,9 +98,9 @@ def test_predict_with_mini_data():
 
     # Runner + (climatology / norm_stats)
     runner = TenYearUnifiedRunner(csv_files_path=".", seq_length=120, pred_length=7)
-    clim = np.load("artifacts/clim_vec.npy")
+    clim = np.load("assets/clim_vec.npy")
     runner.set_climatology(clim)
-    runner.norm_stats = json.load(open("artifacts/norm_stats.json", "r", encoding="utf-8"))
+    runner.norm_stats = json.load(open("assets/norm_stats.json", "r", encoding="utf-8"))
 
     # Build the graph & load weights
     model = SeasonalFNO1D(modes=64, width=96, num_layers=4, input_features=6)

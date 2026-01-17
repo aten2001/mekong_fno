@@ -11,8 +11,8 @@ SEQ_LENGTH   = 120
 PRED_LENGTH  = 7
 
 WEIGHTS_LOC  = "weights"
-CLIM_PATH    = "artifacts/clim_vec.npy"
-NORM_PATH    = "artifacts/norm_stats.json"
+CLIM_PATH    = "assets/clim_vec.npy"
+NORM_PATH    = "assets/norm_stats.json"
 MINI_CSV     = "data-mini/water_level_sample.csv"
 
 def find_weights(path_or_dir: str) -> str:
