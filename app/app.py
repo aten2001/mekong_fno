@@ -82,6 +82,8 @@ CSV_DIR     = os.environ.get("CSV_DIR",     os.path.join(REPO_ROOT, "data"))
 DEFAULT_RUNTIME = "/data/runtime" if os.path.isdir("/data") else os.path.join(REPO_ROOT, ".runtime")
 os.environ.setdefault("RUNTIME_ROOT", DEFAULT_RUNTIME)
 
+print("[debug] sys.path[:3] =", sys.path[:3])
+
 # =============================================================================
 # Runtime layout & canonical runtime files
 # =============================================================================
