@@ -1,0 +1,8 @@
+# runtime outputs (local)
+.runtime/
+
+# local raw data
+data/
+
+# legacy artifacts folder (if still present)
+artifacts_L150/
