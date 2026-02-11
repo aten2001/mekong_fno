@@ -86,6 +86,9 @@ CSV_DIR     = os.environ.get("CSV_DIR",     os.path.join(REPO_ROOT, "data"))
 # - Local:  <repo>/.runtime
 # - HF:     /data/runtime  (persistent volume)
 DEFAULT_RUNTIME = "/data/runtime" if os.path.isdir("/data") else os.path.join(REPO_ROOT, ".runtime")
+
+print("[persist-check] env has RUNTIME_ROOT =", "RUNTIME_ROOT" in os.environ, "value=", os.environ.get("RUNTIME_ROOT"))
+
 os.environ.setdefault("RUNTIME_ROOT", DEFAULT_RUNTIME)
 
 print("[debug] sys.path[:3] =", sys.path[:3])
