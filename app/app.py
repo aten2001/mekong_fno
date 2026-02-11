@@ -110,6 +110,65 @@ from app.runtime_lock import lock_for_path, atomic_write_json, atomic_write_parq
 # NOTE: import-time side effect: may mkdir runtime folders.
 LAYOUT = get_layout()
 
+# =============================================================================
+# Persistent volume probe (/data) via sentinel file
+# =============================================================================
+PERSIST_SENTINEL_NAME = "_persist_sentinel.json"
+
+def _persist_sentinel_path() -> Path:
+    """
+    Sentinel lives under runtime root (prefer LAYOUT.root):
+      /data/runtime/_persist_sentinel.json   (HF with persistent storage)
+      <repo>/.runtime/_persist_sentinel.json (local)
+    """
+    # LAYOUT.root is a Path (per your runtime_paths design)
+    return Path(LAYOUT.root) / PERSIST_SENTINEL_NAME
+
+def persist_probe_sentinel(*, write_if_missing: bool = True) -> dict:
+    """
+    Create/read a sentinel file under the runtime root to verify persistence across restarts.
+
+    Contract:
+    - If sentinel exists: read and return payload; do NOT overwrite.
+    - If missing and write_if_missing=True: write once (atomic) and return payload.
+    - Uses a file lock to avoid races under multi-thread/reload scenarios.
+    """
+    p = _persist_sentinel_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    with lock_for_path(p):
+        if p.exists():
+            try:
+                payload = json.loads(p.read_text(encoding="utf-8"))
+            except Exception as e:
+                payload = {"_read_error": repr(e)}
+            payload["_path"] = str(p)
+            payload["_exists"] = True
+            return payload
+
+        if not write_if_missing:
+            return {"_path": str(p), "_exists": False}
+
+        payload = {
+            "created_at": time.time(),         # unix seconds
+            "pid": os.getpid(),
+            "runtime_root": str(LAYOUT.root),
+        }
+        # atomic write prevents partial file visibility
+        atomic_write_json(p, payload)
+
+        payload["_path"] = str(p)
+        payload["_exists"] = False  # indicates "was missing before write"
+        return payload
+
+def _log_persist_probe(prefix: str, *, write_if_missing: bool) -> None:
+    info = persist_probe_sentinel(write_if_missing=write_if_missing)
+    if info.get("_exists"):
+        print(f"[persist-check] sentinel exists: {info.get('_path')}")
+    else:
+        print(f"[persist-check] sentinel created: {info.get('_path')}")
+    print(f"[persist-check] payload: {json.dumps(info, ensure_ascii=False)}")
+
 # Keep string versions for libraries that expect `str` paths (e.g. pandas read/write helpers).
 RUNTIME_CACHE_DIR = str(LAYOUT.cache)
 RUNTIME_ART_DIR   = str(LAYOUT.artifacts)
@@ -1902,6 +1961,9 @@ if __name__ == "__main__":
     print(f"[runtime] cache={LAYOUT.cache}")
     print(f"[runtime] artifacts={LAYOUT.artifacts}")
 
+    # 2.1/2.2 Persistent storage sentinel (do NOT overwrite if already exists)
+    _log_persist_probe("startup", write_if_missing=True)
+    
     # Warm-up: preload model + data to reduce first-request latency.
     _load_service()
 
