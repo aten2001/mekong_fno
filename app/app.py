@@ -781,6 +781,12 @@ def _load_service(force_reload: bool = False):
 
         print(f"[app] loaded in {time.perf_counter()-t0:.2f}s, days={len(water_daily)}")
 
+        try:
+            print("[runtime][ls] cache dir:", RUNTIME_CACHE_DIR)
+            print("[runtime][ls] cache files:", sorted(os.listdir(RUNTIME_CACHE_DIR))[:200])
+        except Exception as e:
+            print("[runtime][ls] failed:", repr(e))
+
         # Atomic swap: old cache remains valid for in-flight requests
         _APP_CACHE.clear()
         _APP_CACHE.update(new_cache)
