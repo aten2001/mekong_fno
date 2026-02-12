@@ -787,7 +787,7 @@ def _load_service(force_reload: bool = False):
         except Exception as e:
             print("[runtime][ls] failed:", repr(e))
 
-                try:
+        try:
             print("[runtime][ls] runtime dir:", DEFAULT_RUNTIME)
             print("[runtime][ls] runtime files:", sorted(os.listdir(DEFAULT_RUNTIME))[:200])
         except Exception as e:
