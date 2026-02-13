@@ -587,6 +587,68 @@ def _load_or_fit_assist_params(
 _APP_CACHE: dict = {}
 _APP_LOCK = threading.Lock()
 
+def _debug_hard_checks(
+    *,
+    water_daily: pd.Series,
+    need: int,
+    backfill_path: str,
+    tag: str = "",
+):
+    """
+    Hard checks for diagnosing:
+    1) backfill parquet coverage (is it old?)
+    2) NaN holes in recent tail (can force anchor to roll back)
+    """
+    tag_s = f" {tag}" if tag else ""
+
+    # ---------------------------
+    # 4.1 backfill coverage range
+    # ---------------------------
+    try:
+        if os.path.exists(backfill_path):
+            df_bf = pd.read_parquet(backfill_path)
+            # robust column handling (your writer uses ["date","h"], but keep defensive)
+            if "date" in df_bf.columns:
+                dmax = pd.to_datetime(df_bf["date"]).dt.date.max() if len(df_bf) else None
+                dmin = pd.to_datetime(df_bf["date"]).dt.date.min() if len(df_bf) else None
+            else:
+                # fallback: try first column
+                c0 = df_bf.columns[0] if len(df_bf.columns) else None
+                dmax = pd.to_datetime(df_bf[c0]).dt.date.max() if (c0 and len(df_bf)) else None
+                dmin = pd.to_datetime(df_bf[c0]).dt.date.min() if (c0 and len(df_bf)) else None
+
+            print(f"[backfill]{tag_s} rows={len(df_bf)} range={dmin} → {dmax} path={backfill_path}")
+        else:
+            print(f"[backfill]{tag_s} missing: {backfill_path}")
+    except Exception as e:
+        print(f"[backfill]{tag_s} read failed:", repr(e))
+
+    # ----------------------------------------
+    # 4.2 NaN holes in recent tail + anchor end
+    # ----------------------------------------
+    try:
+        if water_daily is None or len(water_daily) == 0:
+            print(f"[water_daily]{tag_s} empty")
+            return
+
+        tail = water_daily.tail(220)
+        nan_tail = [d for d, v in tail.items() if pd.isna(v)]
+        latest_index = max(water_daily.index)
+
+        print(f"[water_daily]{tag_s} last_index={latest_index} nan_in_last_220={len(nan_tail)}")
+        if nan_tail:
+            print(f"[water_daily]{tag_s} nan_dates_tail(head20)={nan_tail[:20]}")
+
+        try:
+            anchor = _latest_contiguous_anchor(water_daily, need)
+            print(f"[anchor]{tag_s} chosen={anchor} latest_index={latest_index}")
+        except Exception as e:
+            print(f"[anchor]{tag_s} failed:", repr(e))
+
+    except Exception as e:
+        print(f"[water_daily]{tag_s} check failed:", repr(e))
+
+
 def _load_service(force_reload: bool = False):
     """
     Initialize and cache the end-to-end inference “service” (model, data, upstream series).
@@ -665,6 +727,14 @@ def _load_service(force_reload: bool = False):
         wd = _merge_hist_and_live_no_gaps(water_daily_hist, backfill, fill_small_holes=True)
         water_daily = _merge_hist_and_live_no_gaps(wd, live_daily, fill_small_holes=True)
 
+        # ---- HARD CHECKS (before backfill write) ----
+        _debug_hard_checks(
+            water_daily=water_daily,
+            need=SEQ_LENGTH,
+            backfill_path=BACKFILL_PATH,
+            tag="before-write",
+        )
+
         # Persist “stable” part of live data into backfill (<= today-1).
         # Rationale: avoid repeated API calls for old days; treat yesterday and earlier as stable.
         try:
@@ -696,6 +766,15 @@ def _load_service(force_reload: bool = False):
                         merged = pd.concat([cur, stable]).groupby(level=0).last().sort_index()
 
                     _atomic_write_backfill_series(BACKFILL_P, merged)
+
+            # ---- HARD CHECKS (after backfill write attempt) ----
+            _debug_hard_checks(
+                water_daily=water_daily,
+                need=SEQ_LENGTH,
+                backfill_path=BACKFILL_PATH,
+                tag="after-write",
+            )
+            # ===========================================================================
 
         except Exception as e:
             print("[app] backfill write skipped:", e)
