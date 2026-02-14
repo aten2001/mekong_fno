@@ -24,8 +24,14 @@ Key design constraints:
 # - Add the repo root to sys.path to make imports stable.
 import os, sys
 ROOT = os.path.dirname(os.path.dirname(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+
+# Ensure repo root is the very first import root.
+try:
+    while ROOT in sys.path:
+        sys.path.remove(ROOT)
+except Exception:
+    pass
+sys.path.insert(0, ROOT)
 
 # =============================================================================
 # Imports
