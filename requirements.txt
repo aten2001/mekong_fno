@@ -6,12 +6,14 @@ matplotlib==3.7.2
 requests>=2.31.0
 filelock>=3.12
 
+typing-extensions>=4.8.0,<5
+
 # TensorFlow by OS
-tensorflow==2.13.0           ; sys_platform == "linux"
+tensorflow==2.16.1           ; sys_platform == "linux"
 tensorflow-intel==2.13.0     ; sys_platform == "win32"
 tensorflow-macos==2.13.0     ; sys_platform == "darwin" and platform_machine == "arm64"
 tensorflow-metal==1.1.0      ; sys_platform == "darwin" and platform_machine == "arm64"
 
 # Misc compat
-protobuf>=3.20,<5
+protobuf>=3.20.3,<4
 tzdata==2024.1
