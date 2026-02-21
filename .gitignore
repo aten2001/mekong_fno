@@ -1,8 +1,35 @@
-# runtime outputs (local)
+# Runtime outputs (local)
 .runtime/
+out/
+out_dataset_seed/
 
-# local raw data
+# IDE / UI
+.idea/
+.gradio/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Local raw data
 data/
 
-# legacy artifacts folder (if still present)
+# Legacy
 artifacts_L150/
+weights_L150/
+
+# Images / captures (local-only)
+*.bmp
+*.webp
+*.png
+*.jpg
+*.jpeg
+
+# OS / temp
+.DS_Store
+Thumbs.db
