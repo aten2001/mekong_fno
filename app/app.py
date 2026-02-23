@@ -23,6 +23,10 @@ Key design constraints:
 #   which can break absolute imports such as `from src.runner import ...`.
 # - Add the repo root to sys.path to make imports stable.
 import os, sys
+
+# Force TensorFlow to use legacy tf.keras (Keras 2) behavior on TF>=2.16
+os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+
 ROOT = os.path.dirname(os.path.dirname(__file__))
 
 # Ensure repo root is the very first import root.
