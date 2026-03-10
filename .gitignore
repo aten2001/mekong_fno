@@ -33,3 +33,6 @@ weights_L150/
 # OS / temp
 .DS_Store
 Thumbs.db
+
+# local notebooks (logs / experiments)
+pinn_project/
