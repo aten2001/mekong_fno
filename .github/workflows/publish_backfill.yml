@@ -32,7 +32,7 @@ jobs:
       - name: Publish to dataset
         env:
           OUT_DIR: out
-          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+          HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python scripts/publish_to_hf_dataset.py
