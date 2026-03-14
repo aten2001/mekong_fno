@@ -108,6 +108,7 @@ from app.runtime_files import (
     backtest_metrics_cache_path,
 )
 from app.runtime_lock import lock_for_path, atomic_write_json, atomic_write_parquet
+from app.sync_artifacts import sync_backfill_from_dataset, sync_status_from_dataset
 
 # NOTE: import-time side effect: may mkdir runtime folders.
 LAYOUT = get_layout()
@@ -121,6 +122,8 @@ RUNTIME_ART_DIR   = str(LAYOUT.artifacts)
 # - Provide str for legacy helpers/third-party APIs
 BACKFILL_P: Path = backfill_path(LAYOUT)                  # Path for lock + atomic parquet writes
 BACKFILL_PATH    = str(BACKFILL_P)                        # str for existing backfill helpers
+DATASET_REPO = os.environ.get("HF_DATASET_REPO", "").strip()
+HF_READ_TOKEN = os.environ.get("HF_READ_TOKEN", "").strip() or None
 LIVE_CACHE       = str(live_cache_daily_default(LAYOUT))  # JSON cache: target station recent daily series
 LIVE_CACHE_3S    = str(live_cache_3s(LAYOUT))             # JSON cache: 3S upstream recent daily series
 LIVE_CACHE_PAKSE = str(live_cache_pakse(LAYOUT))          # JSON cache: Pakse upstream recent daily series
@@ -1770,7 +1773,15 @@ def ui_reload_service():
     """
     t0 = time.perf_counter()
 
-    # force reload
+    # 1) sync dataset artifacts first
+    if DATASET_REPO:
+        try:
+            sync_status_from_dataset(DATASET_REPO, LAYOUT.artifacts, token=HF_READ_TOKEN)
+            sync_backfill_from_dataset(DATASET_REPO, BACKFILL_P, token=HF_READ_TOKEN)
+        except Exception as e:
+            print("[sync][warn] reload sync failed:", repr(e))
+
+    # 2) then force reload so the new backfill is actually used
     S = _load_service(force_reload=True)
 
     water_daily = S.get("water_daily")
@@ -1903,6 +1914,13 @@ if __name__ == "__main__":
     print(f"[runtime] root={LAYOUT.root}")
     print(f"[runtime] cache={LAYOUT.cache}")
     print(f"[runtime] artifacts={LAYOUT.artifacts}")
+
+    if DATASET_REPO:
+        try:
+            sync_status_from_dataset(DATASET_REPO, LAYOUT.artifacts, token=HF_READ_TOKEN)
+            sync_backfill_from_dataset(DATASET_REPO, BACKFILL_P, token=HF_READ_TOKEN)
+        except Exception as e:
+            print("[sync][warn] startup sync failed:", repr(e))
 
     # Warm-up: preload model + data to reduce first-request latency.
     _load_service()
