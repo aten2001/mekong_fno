@@ -110,30 +110,6 @@ from app.runtime_files import (
 from app.runtime_lock import lock_for_path, atomic_write_json, atomic_write_parquet
 from app.sync_artifacts import sync_backfill_from_dataset, sync_status_from_dataset
 
-from pathlib import Path
-import os
-import traceback
-
-def probe_data_mount():
-    p = Path("/data")
-    print(f"[probe] /data exists={p.exists()} is_dir={p.is_dir()}")
-    print(f"[probe] /data readable={os.access('/data', os.R_OK)} writable={os.access('/data', os.W_OK)}")
-
-    test_dir = Path("/data/runtime")
-    test_file = test_dir / ".write_probe"
-
-    try:
-        test_dir.mkdir(parents=True, exist_ok=True)
-        test_file.write_text("ok", encoding="utf-8")
-        test_file.unlink(missing_ok=True)
-        print("[probe] /data/runtime write test = OK")
-    except Exception as e:
-        print("[probe] /data/runtime write test = FAIL")
-        print("[probe] exception =", repr(e))
-        traceback.print_exc()
-
-probe_data_mount()
-
 # NOTE: import-time side effect: may mkdir runtime folders.
 LAYOUT = get_layout()
 
