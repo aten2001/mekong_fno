@@ -1136,7 +1136,8 @@ def _backtest_ytd_1day(runner, water_daily, start="2025-01-01", end=None, horizo
 # =============================================================================
 def ui_eval_ytd(horizon=1):
     """
-    Tab2 callback: run a 2025 YTD k-day-ahead backtest and render an OvsP plot.
+    Tab2 callback: run a k-day-ahead backtest from 2025-01-01 to the latest available date
+    and render an Observed vs Predicted plot.
 
     Enhancements:
     - Optionally fits upstream assist models (3S, Pakse) on the same backtest rows
@@ -1169,7 +1170,7 @@ def ui_eval_ytd(horizon=1):
     )
 
     if df is None or len(df) == 0:
-        return None, f"Not enough data to backtest 2025 YTD (h={horizon}).", pd.DataFrame()
+        return None, f"Not enough data to backtest from 2025-01-01 to the latest available date (h={horizon}).", pd.DataFrame()
 
     # -------------------------------------------------------------------------
     # Optional overlays: assist correction on the *same* backtest rows
@@ -1213,12 +1214,14 @@ def ui_eval_ytd(horizon=1):
         plt.plot(df["date"], y_corr_pk, label=f"FNO + Pakse ({horizon}-day)", linewidth=1.8)
     plt.axhline(ALARM_LEVEL, linestyle="--", color="darkgoldenrod", linewidth=1, label=f"Alarm {ALARM_LEVEL:.1f} m")
     plt.axhline(FLOOD_LEVEL, linestyle="--", color="red", linewidth=1, label=f"Flood {FLOOD_LEVEL:.1f} m")
-    plt.title(f"2025 YTD — Observed vs Predicted ({horizon}-day ahead)")
+    start_date = "2025-01-01"
+    end_date = df["date"].iloc[-1].date()
+    plt.title(f"Observed vs Predicted ({horizon}-day ahead)\nBacktest: {start_date} to {end_date}")
     plt.xlabel("Date"); plt.ylabel("Water Level (m)")
     plt.xticks(rotation=20); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
 
     note = (
-        f"Backtest window: 2025-01-01 → {df['date'].iloc[-1].date()} "
+        f"Backtest period: 2025-01-01 → {df['date'].iloc[-1].date()} "
         f"| Horizon={horizon} day(s) | N={len(df)} | RMSE={rmse:.3f} m "
         f"| Alarm={ALARM_LEVEL:.1f} m, Flood={FLOOD_LEVEL:.1f} m"
         f"{note_extra}"
@@ -1818,7 +1821,7 @@ def build_app():
         gr.Markdown(
             "### Mekong Water Level Forecast (Stung Treng) — FNO\n"
             "- Tab1: **Forecast Today → +7 days** (optional uncertainty)\n"
-            "- Tab2: **ΔRMSE alignment evaluation** (reads `assets/phase_report.json`)"
+            "- Tab2: **Backtest since 2025-01-01 and ΔRMSE alignment evaluation**"
         )
 
         # ---------------------------------------------------------------------
@@ -1857,14 +1860,14 @@ def build_app():
             # =================================================================
             # Tab2: Evaluation (2025 YTD & ΔRMSE)
             # =================================================================
-            with gr.Tab("Evaluation (2025 YTD & ΔRMSE)"):
+            with gr.Tab("Evaluation (Backtest since 2025-01-01 & ΔRMSE)"):
                 # shared horizon selector for backtest/compare
                 with gr.Row():
                     h_sel = gr.Slider(1, 7, value=1, step=1, label="Backtest horizon (days ahead)", interactive=True)
 
                 # ----------------- YTD backtest -----------------
                 with gr.Row():
-                    btn_bt = gr.Button("Run 2025 YTD backtest (k-day ahead)", variant="primary")
+                    btn_bt = gr.Button("Run backtest from 2025-01-01 (k-day ahead)", variant="primary")
                 ytd_plot = gr.Plot()
                 ytd_note = gr.Markdown()
                 ytd_df = gr.Dataframe(interactive=False)
