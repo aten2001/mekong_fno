@@ -157,6 +157,57 @@ WET_MONTHS = (6, 7, 8, 9, 10, 11)
 DRY_SHRINK = float(os.environ.get("PAKSE_DRY_SHRINK", "0.4"))  # λ ∈ [0,1], shrink delta outside wet season
 
 # =============================================================================
+# Evaluation plot display controls
+# =============================================================================
+EVAL_LAYER_CHOICES = [
+    "Observed",
+    "Persistence",
+    "FNO",
+    "FNO + 3S",
+    "FNO + Pakse",
+    "Alarm",
+    "Flood",
+]
+
+DEFAULT_EVAL_LAYERS = [
+    "Observed",
+    "Persistence",
+    "FNO + Pakse",
+    "Alarm",
+    "Flood",
+]
+
+EVAL_COMPARISON_MODE_TO_LAYERS = {
+    "Observed vs Persistence": ["Observed", "Persistence", "Alarm", "Flood"],
+    "Observed vs FNO": ["Observed", "FNO", "Alarm", "Flood"],
+    "Observed vs FNO + 3S": ["Observed", "FNO + 3S", "Alarm", "Flood"],
+    "Observed vs FNO + Pakse": ["Observed", "FNO + Pakse", "Alarm", "Flood"],
+    "Observed vs FNO + Pakse vs Persistence": ["Observed", "Persistence", "FNO + Pakse", "Alarm", "Flood"],
+    "All model variants": ["Observed", "Persistence", "FNO", "FNO + 3S", "FNO + Pakse", "Alarm", "Flood"],
+}
+
+def _resolve_eval_layers(comparison_mode: str, use_custom_layers: bool, selected_layers):
+    """
+    Resolve which layers should be drawn in Tab2.
+
+    Priority:
+    1) If custom-layer mode is enabled, use the CheckboxGroup selection.
+    2) Otherwise use the predefined comparison-mode mapping.
+    3) Always preserve the canonical order in EVAL_LAYER_CHOICES.
+    """
+    if use_custom_layers:
+        layers = list(selected_layers or DEFAULT_EVAL_LAYERS)
+    else:
+        layers = list(EVAL_COMPARISON_MODE_TO_LAYERS.get(
+            comparison_mode,
+            DEFAULT_EVAL_LAYERS
+        ))
+
+    keep = set(layers)
+    ordered = [x for x in EVAL_LAYER_CHOICES if x in keep]
+    return ordered or DEFAULT_EVAL_LAYERS
+
+# =============================================================================
 # Data utilities
 # =============================================================================
 def _merge_hist_and_live_no_gaps(water_daily_hist: pd.Series,
@@ -1132,31 +1183,75 @@ def _backtest_ytd_1day(runner, water_daily, start="2025-01-01", end=None, horizo
     return df, rmse
 
 # =============================================================================
-# Tab2 callback: YTD backtest plot (Observed vs Predicted)
+# Persistence baseline predictions and RMSE to backtest
 # =============================================================================
-def ui_eval_ytd(horizon=1):
+def _attach_persistence_backtest(df_backtest: pd.DataFrame, water_daily: pd.Series, horizon: int):
+    """
+    Attach a k-day-ahead persistence baseline to an existing backtest dataframe.
+
+    For a target date T, the persistence prediction is the last observed level
+    available at the anchor date (T - horizon).
+
+    Returns:
+        (df_out, rmse_pers):
+          df_out: copy of df_backtest with column 'h_pred_Pers'
+          rmse_pers: RMSE of the persistence baseline on rows where both truth and
+                     persistence prediction are finite
+    """
+    if df_backtest is None or len(df_backtest) == 0:
+        return df_backtest, None
+
+    df = df_backtest.copy()
+    k = int(horizon)
+
+    pers_vals = []
+    for d in pd.to_datetime(df["date"]).dt.date:
+        anchor = pd.Timestamp(d) - pd.Timedelta(days=k)
+        key = anchor.date()
+        v = water_daily.get(key, np.nan)
+        pers_vals.append(float(v) if pd.notna(v) else np.nan)
+
+    df["h_pred_Pers"] = np.asarray(pers_vals, dtype=np.float32)
+
+    mask = np.isfinite(df["h_pred_Pers"].values) & np.isfinite(df["h_true"].values)
+    if mask.sum() > 0:
+        rmse_pers = float(np.sqrt(np.mean((df.loc[mask, "h_pred_Pers"].values - df.loc[mask, "h_true"].values) ** 2)))
+    else:
+        rmse_pers = None
+
+    return df, rmse_pers
+
+# =============================================================================
+# Tab2 callback: YTD backtest plot (Observed vs FNO + Pakse vs Persistence)
+# =============================================================================
+def ui_eval_ytd(
+    horizon=1,
+    comparison_mode="Observed vs FNO + Pakse vs Persistence",
+    use_custom_layers=False,
+    selected_layers=None,
+):
     """
     Tab2 callback: run a k-day-ahead backtest from 2025-01-01 to the latest available date
-    and render an Observed vs Predicted plot.
+    and render a configurable evaluation plot.
 
-    Enhancements:
-    - Optionally fits upstream assist models (3S, Pakse) on the same backtest rows
-      and overlays corrected predictions (for comparison only).
+    Display logic:
+    - Comparison mode controls the default visible lines.
+    - If custom-layer mode is enabled, CheckboxGroup selections override comparison mode.
 
     Returns:
         (fig, note, df):
           fig: matplotlib.figure.Figure | None
-          note: summary string (date window, horizon, N, RMSE, overlays)
-          df: columns include date, h_true, h_pred (+ optional assist columns)
+          note: summary string (date window, horizon, N, RMSE, visible layers)
+          df: columns include date, h_true, h_pred, h_pred_Pers (+ optional assist columns)
     """
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
-    w3s_daily   = S.get("w3s_daily")
+    w3s_daily = S.get("w3s_daily")
     pakse_daily = S.get("pakse_daily")
 
     year = 2025
     k = int(horizon)
-    last_date = max(water_daily.index)  # python date
+    last_date = max(water_daily.index)
     model_id = S.get("model_id") or Path(_find_ckpt()).name
 
     df, rmse = _load_or_run_backtest_ytd_cached(
@@ -1173,6 +1268,11 @@ def ui_eval_ytd(horizon=1):
         return None, f"Not enough data to backtest from 2025-01-01 to the latest available date (h={horizon}).", pd.DataFrame()
 
     # -------------------------------------------------------------------------
+    # Attach persistence baseline on the same backtest rows
+    # -------------------------------------------------------------------------
+    df, rmse_pers = _attach_persistence_backtest(df, water_daily, horizon=k)
+
+    # -------------------------------------------------------------------------
     # Optional overlays: assist correction on the *same* backtest rows
     # -------------------------------------------------------------------------
     note_extra = ""
@@ -1185,11 +1285,10 @@ def ui_eval_ytd(horizon=1):
             mask = ~np.isnan(y_corr) & ~np.isnan(df["h_true"].values)
             if mask.sum() >= 30:
                 rmse_corr = float(np.sqrt(np.mean((y_corr[mask] - df["h_true"].values[mask]) ** 2)))
-                note_extra += f" | 3S assist: k={params['k']}, N={int(mask.sum())}, RMSE_adj={rmse_corr:.3f} m (vs {rmse:.3f})"
+                note_extra += f" | 3S assist: k={params['k']}, N={int(mask.sum())}, RMSE_adj={rmse_corr:.3f} m (vs FNO {rmse:.3f})"
             df["h_pred_3S"] = y_corr
-            df["delta_3S"]  = deltas
+            df["delta_3S"] = deltas
 
-    # ---- Pakse assist on this horizon ----
     y_corr_pk = None
     if pakse_daily is not None and len(pakse_daily) > 0:
         params_pk = _fit_3s_residual_model(df, pakse_daily, k_grid=(0, 1, 2, 3))
@@ -1198,43 +1297,83 @@ def ui_eval_ytd(horizon=1):
             mask_pk = ~np.isnan(y_corr_pk) & ~np.isnan(df["h_true"].values)
             if mask_pk.sum() >= 30:
                 rmse_pk = float(np.sqrt(np.mean((y_corr_pk[mask_pk] - df["h_true"].values[mask_pk]) ** 2)))
-                note_extra += f" | Pakse assist: k={params_pk['k']}, N={int(mask_pk.sum())}, RMSE_adj={rmse_pk:.3f} m (vs {rmse:.3f})"
+                note_extra += f" | Pakse assist: k={params_pk['k']}, N={int(mask_pk.sum())}, RMSE_adj={rmse_pk:.3f} m (vs FNO {rmse:.3f})"
             df["h_pred_Pakse"] = y_corr_pk
-            df["delta_Pakse"]  = deltas_pk
+            df["delta_Pakse"] = deltas_pk
+
+    visible_layers = _resolve_eval_layers(
+        comparison_mode=comparison_mode,
+        use_custom_layers=use_custom_layers,
+        selected_layers=selected_layers,
+    )
 
     # -------------------------------------------------------------------------
     # Plot
     # -------------------------------------------------------------------------
-    fig = plt.figure(figsize=(10.5, 4.0))
-    plt.plot(df["date"], df["h_true"], label="Observed", linewidth=1.8)
-    plt.plot(df["date"], df["h_pred"], label=f"FNO ({horizon}-day ahead)", linewidth=1.8)
-    if y_corr is not None:
+    fig = plt.figure(figsize=(10.8, 4.4))
+
+    if "Observed" in visible_layers:
+        plt.plot(df["date"], df["h_true"], label="Observed", linewidth=2.0)
+
+    if "Persistence" in visible_layers and "h_pred_Pers" in df.columns:
+        plt.plot(df["date"], df["h_pred_Pers"], label=f"Persistence ({horizon}-day ahead)", linewidth=1.8)
+
+    if "FNO" in visible_layers:
+        plt.plot(df["date"], df["h_pred"], label=f"FNO ({horizon}-day ahead)", linewidth=1.8)
+
+    if "FNO + 3S" in visible_layers and y_corr is not None:
         plt.plot(df["date"], y_corr, label=f"FNO + 3S ({horizon}-day)", linewidth=1.8)
-    if y_corr_pk is not None:
+
+    if "FNO + Pakse" in visible_layers and y_corr_pk is not None:
         plt.plot(df["date"], y_corr_pk, label=f"FNO + Pakse ({horizon}-day)", linewidth=1.8)
-    plt.axhline(ALARM_LEVEL, linestyle="--", color="darkgoldenrod", linewidth=1, label=f"Alarm {ALARM_LEVEL:.1f} m")
-    plt.axhline(FLOOD_LEVEL, linestyle="--", color="red", linewidth=1, label=f"Flood {FLOOD_LEVEL:.1f} m")
+
+    if "Alarm" in visible_layers:
+        plt.axhline(ALARM_LEVEL, linestyle="--", color="darkgoldenrod", linewidth=1, label=f"Alarm {ALARM_LEVEL:.1f} m")
+
+    if "Flood" in visible_layers:
+        plt.axhline(FLOOD_LEVEL, linestyle="--", color="red", linewidth=1, label=f"Flood {FLOOD_LEVEL:.1f} m")
+
     start_date = "2025-01-01"
     end_date = df["date"].iloc[-1].date()
-    plt.title(f"Observed vs Predicted ({horizon}-day ahead)\nBacktest: {start_date} to {end_date}")
-    plt.xlabel("Date"); plt.ylabel("Water Level (m)")
-    plt.xticks(rotation=20); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+    view_name = "Custom layers" if use_custom_layers else comparison_mode
 
-    note = (
-        f"Backtest period: 2025-01-01 → {df['date'].iloc[-1].date()} "
-        f"| Horizon={horizon} day(s) | N={len(df)} | RMSE={rmse:.3f} m "
-        f"| Alarm={ALARM_LEVEL:.1f} m, Flood={FLOOD_LEVEL:.1f} m"
-        f"{note_extra}"
+    plt.title(
+        f"Observed vs Predicted ({horizon}-day ahead)\n"
+        f"Backtest: {start_date} to {end_date} | View: {view_name}"
     )
+    plt.xlabel("Date")
+    plt.ylabel("Water Level (m)")
+    plt.xticks(rotation=20)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
 
-    cols = ["date", "h_true", "h_pred"]
+    note_parts = [
+        f"Backtest period: 2025-01-01 → {df['date'].iloc[-1].date()}",
+        f"Horizon={horizon} day(s)",
+        f"N={len(df)}",
+        f"FNO RMSE={rmse:.3f} m",
+    ]
+    if rmse_pers is not None:
+        note_parts.append(f"Pers RMSE={rmse_pers:.3f} m")
+    note_parts.append(f"Visible={', '.join(visible_layers)}")
+    note_parts.append(f"Alarm={ALARM_LEVEL:.1f} m")
+    note_parts.append(f"Flood={FLOOD_LEVEL:.1f} m")
+
+    note = " | ".join(note_parts) + note_extra
+
+    cols = ["date", "h_true", "h_pred", "h_pred_Pers"]
     if "h_pred_3S" in df.columns:
         if "month" not in df.columns:
             df["month"] = pd.to_datetime(df["date"]).dt.month
         df["wet"] = df["month"].isin(WET_MONTHS)
-        df["changed"] = np.where(np.isfinite(df.get("delta_3S", np.nan)) & (np.abs(df.get("delta_3S", 0.0)) > 1e-6),
-                                 True, False)
+        df["changed"] = np.where(
+            np.isfinite(df.get("delta_3S", np.nan)) & (np.abs(df.get("delta_3S", 0.0)) > 1e-6),
+            True,
+            False,
+        )
         cols += ["h_pred_3S", "delta_3S", "wet", "changed"]
+
     if "h_pred_Pakse" in df.columns:
         cols += ["h_pred_Pakse", "delta_Pakse"]
 
@@ -1865,6 +2004,35 @@ def build_app():
                 with gr.Row():
                     h_sel = gr.Slider(1, 7, value=1, step=1, label="Backtest horizon (days ahead)", interactive=True)
 
+                cmp_mode = gr.Radio(
+                    choices=[
+                        "Observed vs Persistence",
+                        "Observed vs FNO",
+                        "Observed vs FNO + 3S",
+                        "Observed vs FNO + Pakse",
+                        "Observed vs FNO + Pakse vs Persistence",
+                        "All model variants",
+                    ],
+                    value="Observed vs FNO + Pakse vs Persistence",
+                    label="Comparison mode",
+                )
+
+                use_custom_layers = gr.Checkbox(
+                    value=False,
+                    label="Use custom layer selection",
+                )
+
+                with gr.Accordion("Advanced layers", open=False):
+                    custom_layers = gr.CheckboxGroup(
+                        choices=EVAL_LAYER_CHOICES,
+                        value=DEFAULT_EVAL_LAYERS,
+                        label="Visible curves / thresholds",
+                    )
+                    gr.Markdown(
+                        "When **Use custom layer selection** is checked, the plot ignores "
+                        "**Comparison mode** and uses the selected layers here."
+                    )
+
                 # ----------------- YTD backtest -----------------
                 with gr.Row():
                     btn_bt = gr.Button("Run backtest from 2025-01-01 (k-day ahead)", variant="primary")
@@ -1873,7 +2041,11 @@ def build_app():
                 ytd_df = gr.Dataframe(interactive=False)
 
                 # Dataflow: h_sel -> ui_eval_ytd -> (plot, note, df)
-                bt_evt = btn_bt.click(fn=ui_eval_ytd, inputs=h_sel, outputs=[ytd_plot, ytd_note, ytd_df])
+                bt_evt = btn_bt.click(
+                    fn=ui_eval_ytd,
+                    inputs=[h_sel, cmp_mode, use_custom_layers, custom_layers],
+                    outputs=[ytd_plot, ytd_note, ytd_df],
+                )
 
                 # ----------------- Comparisons: 3S -----------------
                 gr.Markdown("### FNO vs FNO + 3S (Only where 3S is available)")
