@@ -1222,6 +1222,80 @@ def _attach_persistence_backtest(df_backtest: pd.DataFrame, water_daily: pd.Seri
     return df, rmse_pers
 
 # =============================================================================
+# Tab2 note / metrics summary helpers
+# =============================================================================
+EVAL_METRIC_MODEL_ORDER = [
+    "Persistence",
+    "FNO",
+    "FNO + 3S",
+    "FNO + Pakse",
+]
+
+def _rmse_against_truth(y_true, y_pred):
+    """
+    Compute RMSE on rows where both truth and prediction are finite.
+    Returns None if there is no valid overlap.
+    """
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(yt) & np.isfinite(yp)
+    if mask.sum() == 0:
+        return None
+    return float(np.sqrt(np.mean((yp[mask] - yt[mask]) ** 2)))
+
+def _build_eval_metrics_summary(metrics_map: dict) -> pd.DataFrame:
+    """
+    Build the full metrics summary table shown under the plot.
+
+    Only models with available RMSE values are included.
+    """
+    rows = []
+    for model_name in EVAL_METRIC_MODEL_ORDER:
+        rmse_val = metrics_map.get(model_name)
+        if rmse_val is None:
+            continue
+        rows.append({
+            "Model": model_name,
+            "RMSE (m)": round(float(rmse_val), 3),
+        })
+    return pd.DataFrame(rows, columns=["Model", "RMSE (m)"])
+
+def _build_eval_note(
+    *,
+    end_date,
+    horizon: int,
+    n_rows: int,
+    visible_layers,
+    metrics_map: dict,
+):
+    """
+    Build the short main note for Tab2.
+
+    Policy:
+    - Show only context + currently visible model metrics.
+    - Do not include hidden model metrics.
+    """
+    parts = [
+        f"Backtest period: 2025-01-01 → {end_date}",
+        f"Horizon={horizon} day(s)",
+        f"N={n_rows}",
+        f"Visible={', '.join(visible_layers)}",
+    ]
+
+    for model_name in EVAL_METRIC_MODEL_ORDER:
+        if model_name in visible_layers:
+            rmse_val = metrics_map.get(model_name)
+            if rmse_val is not None:
+                parts.append(f"{model_name} RMSE={rmse_val:.3f} m")
+
+    if "Alarm" in visible_layers:
+        parts.append(f"Alarm={ALARM_LEVEL:.1f} m")
+    if "Flood" in visible_layers:
+        parts.append(f"Flood={FLOOD_LEVEL:.1f} m")
+
+    return " | ".join(parts)
+
+# =============================================================================
 # Tab2 callback: YTD backtest plot (Observed vs FNO + Pakse vs Persistence)
 # =============================================================================
 def ui_eval_ytd(
@@ -1239,10 +1313,11 @@ def ui_eval_ytd(
     - If custom-layer mode is enabled, CheckboxGroup selections override comparison mode.
 
     Returns:
-        (fig, note, df):
+        (fig, note, metrics_summary, df):
           fig: matplotlib.figure.Figure | None
-          note: summary string (date window, horizon, N, RMSE, visible layers)
-          df: columns include date, h_true, h_pred, h_pred_Pers (+ optional assist columns)
+          note: short summary string for the current visible view only
+          metrics_summary: full RMSE summary table for all evaluated variants
+          df: raw backtest rows with prediction columns
     """
     S = _load_service()
     runner, water_daily = S["runner"], S["water_daily"]
@@ -1264,8 +1339,15 @@ def ui_eval_ytd(
         water_daily=water_daily,
     )
 
+    empty_metrics = pd.DataFrame(columns=["Model", "RMSE (m)"])
+
     if df is None or len(df) == 0:
-        return None, f"Not enough data to backtest from 2025-01-01 to the latest available date (h={horizon}).", pd.DataFrame()
+        return (
+            None,
+            f"Not enough data to backtest from 2025-01-01 to the latest available date (h={horizon}).",
+            empty_metrics,
+            pd.DataFrame(),
+        )
 
     # -------------------------------------------------------------------------
     # Attach persistence baseline on the same backtest rows
@@ -1273,33 +1355,27 @@ def ui_eval_ytd(
     df, rmse_pers = _attach_persistence_backtest(df, water_daily, horizon=k)
 
     # -------------------------------------------------------------------------
-    # Optional overlays: assist correction on the *same* backtest rows
+    # Optional overlays: assist correction on the same backtest rows
     # -------------------------------------------------------------------------
-    note_extra = ""
-
     y_corr = None
+    rmse_corr = None
     if w3s_daily is not None and len(w3s_daily) > 0:
         params = _fit_3s_residual_model(df, w3s_daily, k_grid=(0, 1, 2, 3))
         if params:
             y_corr, deltas = _apply_3s_correction(df, w3s_daily, params)
-            mask = ~np.isnan(y_corr) & ~np.isnan(df["h_true"].values)
-            if mask.sum() >= 30:
-                rmse_corr = float(np.sqrt(np.mean((y_corr[mask] - df["h_true"].values[mask]) ** 2)))
-                note_extra += f" | 3S assist: k={params['k']}, N={int(mask.sum())}, RMSE_adj={rmse_corr:.3f} m (vs FNO {rmse:.3f})"
             df["h_pred_3S"] = y_corr
             df["delta_3S"] = deltas
+            rmse_corr = _rmse_against_truth(df["h_true"].values, y_corr)
 
     y_corr_pk = None
+    rmse_pk = None
     if pakse_daily is not None and len(pakse_daily) > 0:
         params_pk = _fit_3s_residual_model(df, pakse_daily, k_grid=(0, 1, 2, 3))
         if params_pk:
             y_corr_pk, deltas_pk = _apply_3s_correction(df, pakse_daily, params_pk)
-            mask_pk = ~np.isnan(y_corr_pk) & ~np.isnan(df["h_true"].values)
-            if mask_pk.sum() >= 30:
-                rmse_pk = float(np.sqrt(np.mean((y_corr_pk[mask_pk] - df["h_true"].values[mask_pk]) ** 2)))
-                note_extra += f" | Pakse assist: k={params_pk['k']}, N={int(mask_pk.sum())}, RMSE_adj={rmse_pk:.3f} m (vs FNO {rmse:.3f})"
             df["h_pred_Pakse"] = y_corr_pk
             df["delta_Pakse"] = deltas_pk
+            rmse_pk = _rmse_against_truth(df["h_true"].values, y_corr_pk)
 
     visible_layers = _resolve_eval_layers(
         comparison_mode=comparison_mode,
@@ -1348,21 +1424,31 @@ def ui_eval_ytd(
     plt.legend()
     plt.tight_layout()
 
-    note_parts = [
-        f"Backtest period: 2025-01-01 → {df['date'].iloc[-1].date()}",
-        f"Horizon={horizon} day(s)",
-        f"N={len(df)}",
-        f"FNO RMSE={rmse:.3f} m",
-    ]
-    if rmse_pers is not None:
-        note_parts.append(f"Pers RMSE={rmse_pers:.3f} m")
-    note_parts.append(f"Visible={', '.join(visible_layers)}")
-    note_parts.append(f"Alarm={ALARM_LEVEL:.1f} m")
-    note_parts.append(f"Flood={FLOOD_LEVEL:.1f} m")
+    # -------------------------------------------------------------------------
+    # Metrics summary + short note
+    # -------------------------------------------------------------------------
+    metrics_map = {
+        "Persistence": rmse_pers,
+        "FNO": rmse,
+        "FNO + 3S": rmse_corr,
+        "FNO + Pakse": rmse_pk,
+    }
 
-    note = " | ".join(note_parts) + note_extra
+    metrics_summary = _build_eval_metrics_summary(metrics_map)
 
+    note = _build_eval_note(
+        end_date=end_date,
+        horizon=horizon,
+        n_rows=len(df),
+        visible_layers=visible_layers,
+        metrics_map=metrics_map,
+    )
+
+    # -------------------------------------------------------------------------
+    # Raw output table
+    # -------------------------------------------------------------------------
     cols = ["date", "h_true", "h_pred", "h_pred_Pers"]
+
     if "h_pred_3S" in df.columns:
         if "month" not in df.columns:
             df["month"] = pd.to_datetime(df["date"]).dt.month
@@ -1377,7 +1463,7 @@ def ui_eval_ytd(
     if "h_pred_Pakse" in df.columns:
         cols += ["h_pred_Pakse", "delta_Pakse"]
 
-    return fig, note, df[cols]
+    return fig, note, metrics_summary, df[cols]
 
 # =============================================================================
 # Backtest cache (parquet + metrics json): concurrency-safe on-disk artifacts
@@ -2036,15 +2122,24 @@ def build_app():
                 # ----------------- YTD backtest -----------------
                 with gr.Row():
                     btn_bt = gr.Button("Run backtest from 2025-01-01 (k-day ahead)", variant="primary")
+
                 ytd_plot = gr.Plot()
                 ytd_note = gr.Markdown()
-                ytd_df = gr.Dataframe(interactive=False)
 
-                # Dataflow: h_sel -> ui_eval_ytd -> (plot, note, df)
+                gr.Markdown("### Metrics summary")
+                ytd_metrics = gr.Dataframe(
+                    headers=["Model", "RMSE (m)"],
+                    interactive=False,
+                )
+
+                with gr.Accordion("Backtest rows", open=False):
+                    ytd_df = gr.Dataframe(interactive=False)
+
+                # Dataflow: h_sel -> ui_eval_ytd -> (plot, note, metrics_summary, raw_df)
                 bt_evt = btn_bt.click(
                     fn=ui_eval_ytd,
                     inputs=[h_sel, cmp_mode, use_custom_layers, custom_layers],
-                    outputs=[ytd_plot, ytd_note, ytd_df],
+                    outputs=[ytd_plot, ytd_note, ytd_metrics, ytd_df],
                 )
 
                 # ----------------- Comparisons: 3S -----------------
