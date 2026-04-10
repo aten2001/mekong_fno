@@ -1296,6 +1296,147 @@ def _build_eval_note(
     return " | ".join(parts)
 
 # =============================================================================
+# Tab2 advanced diagnostics (availability-aware comparisons & routing)
+# =============================================================================
+def _mae_against_truth(y_true, y_pred):
+    """
+    Compute MAE on rows where both truth and prediction are finite.
+    Returns None if there is no valid overlap.
+    """
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(yt) & np.isfinite(yp)
+    if mask.sum() == 0:
+        return None
+    return float(np.mean(np.abs(yp[mask] - yt[mask])))
+
+
+def _upstream_raw_available_mask(dates, upstream_daily: pd.Series, k: int):
+    """
+    Raw availability mask used for fair subset comparison.
+
+    Definition:
+    - A source is considered 'available' on target date T if the lag-aligned
+      upstream date (T - k) exists in the upstream series index and is finite.
+    """
+    lag_dates = np.array([d - pd.Timedelta(days=int(k)) for d in dates], dtype="object")
+    return np.array(
+        [(ld in upstream_daily.index) and pd.notna(upstream_daily.get(ld)) for ld in lag_dates],
+        dtype=bool,
+    )
+
+
+def _prepare_assist_eval_bundle(horizon=1):
+    """
+    Build a shared evaluation bundle for:
+      - 3S-only comparison
+      - Pakse-only comparison
+      - common-overlap comparison
+      - availability summary
+      - routing summary
+
+    Returns:
+        dict with either:
+          {"error": "..."}
+        or:
+          {
+            "df": ...,
+            "dates": ...,
+            "h_true": ...,
+            "h_pred": ...,
+            "base_mask": ...,
+            "params_3s": ...,
+            "params_pk": ...,
+            "y_corr_3s": ...,
+            "y_corr_pk": ...,
+            "has_3s": ...,
+            "has_pk": ...,
+            "k_3s": ...,
+            "k_pk": ...,
+            "horizon": ...,
+          }
+    """
+    S = _load_service()
+    runner, water_daily = S["runner"], S["water_daily"]
+    w3s_daily = S.get("w3s_daily")
+    pakse_daily = S.get("pakse_daily")
+
+    year = 2025
+    k_h = int(horizon)
+    last_date = max(water_daily.index)
+    model_id = S.get("model_id") or Path(_find_ckpt()).name
+
+    df, rmse_fno_full = _load_or_run_backtest_ytd_cached(
+        year=year,
+        k=k_h,
+        station=STATION_CODE,
+        model_id=model_id,
+        last_date=last_date,
+        runner=runner,
+        water_daily=water_daily,
+    )
+
+    if df is None or len(df) == 0:
+        return {"error": f"Not enough data (h={horizon})."}
+
+    df = df.copy()
+    dates = pd.to_datetime(df["date"]).dt.date.values
+    h_true = df["h_true"].values.astype(float)
+    h_pred = df["h_pred"].values.astype(float)
+    base_mask = np.isfinite(h_true) & np.isfinite(h_pred)
+
+    out = {
+        "df": df,
+        "dates": dates,
+        "h_true": h_true,
+        "h_pred": h_pred,
+        "base_mask": base_mask,
+        "horizon": k_h,
+        "rmse_fno_full": rmse_fno_full,
+        "mae_fno_full": _mae_against_truth(h_true, h_pred),
+        "params_3s": None,
+        "params_pk": None,
+        "y_corr_3s": None,
+        "y_corr_pk": None,
+        "has_3s": np.zeros(len(df), dtype=bool),
+        "has_pk": np.zeros(len(df), dtype=bool),
+        "k_3s": None,
+        "k_pk": None,
+    }
+
+    # 3S
+    if w3s_daily is not None and len(w3s_daily) > 0:
+        params_3s = _fit_3s_residual_model(df, w3s_daily, k_grid=(0, 1, 2, 3))
+        if params_3s:
+            y_corr_3s, _ = _apply_3s_correction(df, w3s_daily, params_3s)
+            k_3s = int(params_3s["k"])
+            has_3s = _upstream_raw_available_mask(dates, w3s_daily, k_3s)
+
+            out.update({
+                "params_3s": params_3s,
+                "y_corr_3s": y_corr_3s,
+                "has_3s": has_3s,
+                "k_3s": k_3s,
+            })
+
+    # Pakse
+    if pakse_daily is not None and len(pakse_daily) > 0:
+        params_pk = _fit_3s_residual_model(df, pakse_daily, k_grid=(0, 1, 2, 3))
+        if params_pk:
+            y_corr_pk, _ = _apply_3s_correction(df, pakse_daily, params_pk)
+            k_pk = int(params_pk["k"])
+            has_pk = _upstream_raw_available_mask(dates, pakse_daily, k_pk)
+
+            out.update({
+                "params_pk": params_pk,
+                "y_corr_pk": y_corr_pk,
+                "has_pk": has_pk,
+                "k_pk": k_pk,
+            })
+
+    return out
+
+# =============================================================================
 # Tab2 callback: YTD backtest plot (Observed vs FNO + Pakse vs Persistence)
 # =============================================================================
 def ui_eval_ytd(
@@ -1989,6 +2130,175 @@ def ui_compare_fno_vs_pakse_window(horizon=1):
         "ΔMAE":              round(mae_pk - mae_fno, 3),
     }])
 
+def ui_compare_common_overlap_window(horizon=1):
+    """
+    Fair head-to-head comparison on the same dates where both 3S and Pakse
+    are available under their fitted lag-k settings.
+    """
+    B = _prepare_assist_eval_bundle(horizon=horizon)
+    if "error" in B:
+        return pd.DataFrame({"message": [B["error"]]})
+
+    if B["params_3s"] is None or B["params_pk"] is None:
+        return pd.DataFrame({"message": ["Need both fitted 3S and Pakse assist parameters to compare on common dates."]})
+
+    h_true = B["h_true"]
+    h_pred = B["h_pred"]
+    y3 = np.asarray(B["y_corr_3s"], dtype=float)
+    ypk = np.asarray(B["y_corr_pk"], dtype=float)
+
+    mask = (
+        B["base_mask"]
+        & B["has_3s"]
+        & B["has_pk"]
+        & np.isfinite(y3)
+        & np.isfinite(ypk)
+    )
+
+    if mask.sum() == 0:
+        return pd.DataFrame({"message": ["No common overlap dates where both 3S and Pakse are available."]})
+
+    idx = np.where(mask)[0]
+    d_sub = np.asarray(B["dates"])[idx]
+
+    rmse_fno = _rmse_against_truth(h_true[idx], h_pred[idx])
+    rmse_3s = _rmse_against_truth(h_true[idx], y3[idx])
+    rmse_pk = _rmse_against_truth(h_true[idx], ypk[idx])
+
+    mae_fno = _mae_against_truth(h_true[idx], h_pred[idx])
+    mae_3s = _mae_against_truth(h_true[idx], y3[idx])
+    mae_pk = _mae_against_truth(h_true[idx], ypk[idx])
+
+    rmse_map = {
+        "FNO": rmse_fno,
+        "FNO + 3S": rmse_3s,
+        "FNO + Pakse": rmse_pk,
+    }
+    mae_map = {
+        "FNO": mae_fno,
+        "FNO + 3S": mae_3s,
+        "FNO + Pakse": mae_pk,
+    }
+
+    best_rmse_variant = min(rmse_map, key=rmse_map.get)
+    best_mae_variant = min(mae_map, key=mae_map.get)
+
+    return pd.DataFrame([{
+        "Window": f"3S & Pakse overlap (same dates, h={horizon})",
+        "k_3S (days)": B["k_3s"],
+        "k_Pakse (days)": B["k_pk"],
+        "N_overlap": int(len(idx)),
+        "From": str(d_sub.min()),
+        "To": str(d_sub.max()),
+        "RMSE (FNO)": round(rmse_fno, 3),
+        "RMSE (FNO+3S)": round(rmse_3s, 3),
+        "RMSE (FNO+Pakse)": round(rmse_pk, 3),
+        "MAE (FNO)": round(mae_fno, 3),
+        "MAE (FNO+3S)": round(mae_3s, 3),
+        "MAE (FNO+Pakse)": round(mae_pk, 3),
+        "Best RMSE variant": best_rmse_variant,
+        "Best MAE variant": best_mae_variant,
+    }])
+
+def ui_availability_summary(horizon=1):
+    """
+    Summarize source availability under the fitted lag-k settings.
+    """
+    B = _prepare_assist_eval_bundle(horizon=horizon)
+    if "error" in B:
+        return pd.DataFrame({"message": [B["error"]]})
+
+    n_total = int(len(B["df"]))
+
+    has_3s = B["has_3s"] if B["params_3s"] is not None else np.zeros(n_total, dtype=bool)
+    has_pk = B["has_pk"] if B["params_pk"] is not None else np.zeros(n_total, dtype=bool)
+
+    n_3s = int(has_3s.sum())
+    n_pk = int(has_pk.sum())
+    n_both = int((has_3s & has_pk).sum())
+    n_3s_only = int((has_3s & ~has_pk).sum())
+    n_pk_only = int((has_pk & ~has_3s).sum())
+    n_neither = int((~has_3s & ~has_pk).sum())
+
+    return pd.DataFrame([{
+        "Window": f"Availability summary (h={horizon})",
+        "Horizon": int(horizon),
+        "Total backtest days": n_total,
+        "k_3S (days)": B["k_3s"],
+        "k_Pakse (days)": B["k_pk"],
+        "3S available days": n_3s,
+        "Pakse available days": n_pk,
+        "Both available days": n_both,
+        "3S only days": n_3s_only,
+        "Pakse only days": n_pk_only,
+        "Neither available days": n_neither,
+        "3S availability rate (%)": round(100.0 * n_3s / n_total, 1) if n_total else None,
+        "Pakse availability rate (%)": round(100.0 * n_pk / n_total, 1) if n_total else None,
+        "Overlap rate (%)": round(100.0 * n_both / n_total, 1) if n_total else None,
+    }])
+
+def ui_operational_routing_summary(horizon=1):
+    """
+    Evaluate an availability-aware routing policy:
+
+      Pakse available -> use FNO + Pakse
+      else if 3S available -> use FNO + 3S
+      else -> fallback to base FNO
+    """
+    B = _prepare_assist_eval_bundle(horizon=horizon)
+    if "error" in B:
+        return pd.DataFrame({"message": [B["error"]]})
+
+    h_true = B["h_true"]
+    h_pred = B["h_pred"]
+    routed = h_pred.copy()
+
+    n_total = int(len(B["df"]))
+    has_3s = B["has_3s"] if B["params_3s"] is not None else np.zeros(n_total, dtype=bool)
+    has_pk = B["has_pk"] if B["params_pk"] is not None else np.zeros(n_total, dtype=bool)
+
+    # start with 3S fallback over base FNO
+    use_3s = has_3s.copy()
+    if B["y_corr_3s"] is not None:
+        routed[use_3s] = np.asarray(B["y_corr_3s"], dtype=float)[use_3s]
+
+    # Pakse takes precedence over 3S
+    use_pk = has_pk.copy()
+    if B["y_corr_pk"] is not None:
+        routed[use_pk] = np.asarray(B["y_corr_pk"], dtype=float)[use_pk]
+
+    # final routing source counts
+    src = np.full(n_total, "FNO", dtype=object)
+    src[use_3s] = "FNO + 3S"
+    src[use_pk] = "FNO + Pakse"  # overwrite priority
+
+    use_pk_n = int((src == "FNO + Pakse").sum())
+    use_3s_n = int((src == "FNO + 3S").sum())
+    fallback_n = int((src == "FNO").sum())
+
+    rmse_fno = _rmse_against_truth(h_true, h_pred)
+    rmse_routed = _rmse_against_truth(h_true, routed)
+    mae_fno = _mae_against_truth(h_true, h_pred)
+    mae_routed = _mae_against_truth(h_true, routed)
+
+    return pd.DataFrame([{
+        "Routing policy": "Pakse > 3S > FNO fallback",
+        "Horizon": int(horizon),
+        "N_total": n_total,
+        "RMSE (FNO full)": round(rmse_fno, 3) if rmse_fno is not None else None,
+        "RMSE (routed)": round(rmse_routed, 3) if rmse_routed is not None else None,
+        "ΔRMSE": round(rmse_routed - rmse_fno, 3) if (rmse_fno is not None and rmse_routed is not None) else None,
+        "MAE (FNO full)": round(mae_fno, 3) if mae_fno is not None else None,
+        "MAE (routed)": round(mae_routed, 3) if mae_routed is not None else None,
+        "ΔMAE": round(mae_routed - mae_fno, 3) if (mae_fno is not None and mae_routed is not None) else None,
+        "Use Pakse days": use_pk_n,
+        "Use 3S days": use_3s_n,
+        "Fallback FNO days": fallback_n,
+        "Use Pakse rate (%)": round(100.0 * use_pk_n / n_total, 1) if n_total else None,
+        "Use 3S rate (%)": round(100.0 * use_3s_n / n_total, 1) if n_total else None,
+        "Fallback FNO rate (%)": round(100.0 * fallback_n / n_total, 1) if n_total else None,
+    }])
+
 # =============================================================================
 # Service lifecycle (manual reload)
 # =============================================================================
@@ -2142,22 +2452,81 @@ def build_app():
                     outputs=[ytd_plot, ytd_note, ytd_metrics, ytd_df],
                 )
 
-                # ----------------- Comparisons: 3S -----------------
-                gr.Markdown("### FNO vs FNO + 3S (Only where 3S is available)")
-                with gr.Row():
-                    btn_cmp = gr.Button("Compare on 3S-available dates (RMSE & MAE)", variant="secondary")
-                cmp_tbl = gr.Dataframe(interactive=False)
+                # ----------------- Advanced diagnostics: availability-aware evaluation -----------------
+                with gr.Accordion("Advanced diagnostics (availability-aware)", open=False):
+                    gr.Markdown(
+                        "These tables separate **source-specific gain**, **fair same-date comparison**, "
+                        "**data availability**, and **real routing performance**."
+                    )
 
-                # manual refresh
+                    with gr.Tabs():
+                        # ----------------- Existing: 3S-only subset -----------------
+                        with gr.Tab("3S-only subset"):
+                            gr.Markdown("### FNO vs FNO + 3S (only where 3S is available)")
+                            with gr.Row():
+                                btn_cmp = gr.Button(
+                                    "Compare on 3S-available dates (RMSE & MAE)",
+                                    variant="secondary",
+                                )
+                            cmp_tbl = gr.Dataframe(interactive=False)
+
+                        # ----------------- Existing: Pakse-only subset -----------------
+                        with gr.Tab("Pakse-only subset"):
+                            gr.Markdown("### FNO vs FNO + Pakse (only where Pakse is available)")
+                            with gr.Row():
+                                btn_cmp_pk = gr.Button(
+                                    "Compare on Pakse-available dates (RMSE & MAE)",
+                                    variant="secondary",
+                                )
+                            pk_tbl = gr.Dataframe(interactive=False)
+
+                        # ----------------- common overlap -----------------
+                        with gr.Tab("Common overlap"):
+                            gr.Markdown("### Fair comparison on dates where both 3S and Pakse are available")
+                            with gr.Row():
+                                btn_cmp_overlap = gr.Button(
+                                    "Compare on common overlap dates",
+                                    variant="secondary",
+                                )
+                            overlap_tbl = gr.Dataframe(interactive=False)
+
+                        # ----------------- availability -----------------
+                        with gr.Tab("Availability"):
+                            gr.Markdown("### Source availability summary")
+                            gr.Markdown(
+                                "> Availability here means: under the fitted lag-k setting, the lag-aligned upstream date exists "
+                                "in the source series and its raw value is finite."
+                            )
+                            with gr.Row():
+                                btn_avail = gr.Button(
+                                    "Summarize source availability",
+                                    variant="secondary",
+                                )
+                            avail_tbl = gr.Dataframe(interactive=False)
+
+                        # ----------------- routing -----------------
+                        with gr.Tab("Routing"):
+                            gr.Markdown("### Operational routing performance")
+                            with gr.Row():
+                                btn_route = gr.Button(
+                                    "Evaluate routed operational performance",
+                                    variant="secondary",
+                                )
+                            route_tbl = gr.Dataframe(interactive=False)
+
+                # ---------- manual refresh ----------
                 btn_cmp.click(fn=ui_compare_fno_vs_3s_window, inputs=h_sel, outputs=cmp_tbl)
-                # automatically refresh once after the backtest completes
-                bt_evt.then(fn=ui_compare_fno_vs_3s_window, inputs=h_sel, outputs=cmp_tbl)
+                btn_cmp_pk.click(fn=ui_compare_fno_vs_pakse_window, inputs=h_sel, outputs=pk_tbl)
+                btn_cmp_overlap.click(fn=ui_compare_common_overlap_window, inputs=h_sel, outputs=overlap_tbl)
+                btn_avail.click(fn=ui_availability_summary, inputs=h_sel, outputs=avail_tbl)
+                btn_route.click(fn=ui_operational_routing_summary, inputs=h_sel, outputs=route_tbl)
 
-                # ----------------- Comparisons: Pakse -----------------
-                gr.Markdown("### FNO vs FNO + Pakse (Only where Pakse is available)")
-                with gr.Row():
-                    btn_cmp_pk = gr.Button("Compare on Pakse-available dates (RMSE & MAE)", variant="secondary")
-                pk_tbl = gr.Dataframe(interactive=False)
+                # ---------- auto refresh after main backtest ----------
+                bt_evt.then(fn=ui_compare_fno_vs_3s_window, inputs=h_sel, outputs=cmp_tbl)
+                bt_evt.then(fn=ui_compare_fno_vs_pakse_window, inputs=h_sel, outputs=pk_tbl)
+                bt_evt.then(fn=ui_compare_common_overlap_window, inputs=h_sel, outputs=overlap_tbl)
+                bt_evt.then(fn=ui_availability_summary, inputs=h_sel, outputs=avail_tbl)
+                bt_evt.then(fn=ui_operational_routing_summary, inputs=h_sel, outputs=route_tbl)
 
                 # manual refresh
                 btn_cmp_pk.click(fn=ui_compare_fno_vs_pakse_window, inputs=h_sel, outputs=pk_tbl)
