@@ -1,5 +1,5 @@
 ---
-title: Mekong FNO Demo
+title: Mekong FNO — Upstream-Assisted Water Level Forecasting System
 emoji: 🌊
 colorFrom: indigo
 colorTo: green
