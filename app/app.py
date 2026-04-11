@@ -1,6 +1,6 @@
 # app/app.py
 """
-Mekong FNO Demo (Gradio app)
+Mekong FNO - Upstream-Assisted Water Level Forecasting System (Gradio app)
 
 This module serves two purposes:
 1) Provide Gradio UI callbacks for forecasting and evaluation.
@@ -659,8 +659,10 @@ def _load_service(force_reload: bool = False):
         wd = _merge_hist_and_live_no_gaps(water_daily_hist, backfill, fill_small_holes=True)
         water_daily = _merge_hist_and_live_no_gaps(wd, live_daily, fill_small_holes=True)
 
+        # ---------------------------------------------------------------------------------------
         # Persist “stable” part of live data into backfill (<= today-1).
         # Rationale: avoid repeated API calls for old days; treat yesterday and earlier as stable.
+        # ---------------------------------------------------------------------------------------
         try:
             stable = None
             if live_daily is not None and len(live_daily) > 0:
@@ -951,7 +953,7 @@ def _latest_contiguous_anchor(water_daily: pd.Series, need: int = 120) -> pd.Tim
         if d.date() in valid_dates:
             run += 1
             if run >= need:
-                # We are scanning backwards: when run hits `need`, `d` is the start of the run.
+                # Scanning backwards: when run hits `need`, `d` is the start of the run.
                 # Anchor is the end (most recent day) of that run.
                 return (d + pd.Timedelta(days=need - 1)).date()
         else:
@@ -1105,7 +1107,7 @@ def _predict_7_abs(runner, Xn, fut_dates, training=False):
 
     Model output semantics:
     - Model predicts standardized anomalies (z-scores) per horizon step.
-    - We de-standardize with (h_std, h_mean) then add per-day climatology (no-leap DOY index).
+    - De-standardize with (h_std, h_mean) then add per-day climatology (no-leap DOY index).
 
     Args:
         training:
@@ -1615,7 +1617,7 @@ def _load_or_run_backtest_ytd_cached(
     k: int,
     station: str,
     model_id: str,
-    last_date,   # python date (your water_daily index uses date)
+    last_date,   # python date (water_daily index uses date)
     runner,
     water_daily: pd.Series,
 ):
@@ -1786,7 +1788,7 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
     pakse_daily = S.get("pakse_daily")
     w3s_daily = S.get("w3s_daily")
 
-    last_date = max(water_daily.index)  # python date, because your index is date
+    last_date = max(water_daily.index)
     model_id = S.get("model_id") or Path(_find_ckpt()).name
 
     # Choose an anchor that guarantees a contiguous, valid SEQ_LENGTH-day window.
