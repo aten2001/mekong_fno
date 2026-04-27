@@ -63,9 +63,28 @@ plt.ioff()  # turn off interactive mode to avoid accidentally launching a GUI
 import gradio as gr
 
 # Project modules
-from src.runner import TenYearUnifiedRunner, doy_sin_cos_series
+from src.runner import TenYearUnifiedRunner
 from src.model_fno import SeasonalFNO1D
-from src.runner import doy_no_leap
+from src.core.assist import (
+    apply_backtest_correction as _apply_3s_correction,
+    apply_future_correction as _apply_upstream_correction_future,
+    fit_pakse_params_for_tab1 as _fit_pakse_params_for_tab1,
+    fit_upstream_residual_model as _fit_3s_residual_model,
+    fit_w3s_params_for_tab1 as _fit_w3s_params_for_tab1,
+    upstream_raw_available_mask as _upstream_raw_available_mask,
+)
+from src.core.backtest import (
+    attach_persistence_backtest as _attach_persistence_backtest,
+    backtest_ytd_1day as _backtest_ytd_1day,
+    mae_against_truth as _mae_against_truth,
+    rmse_against_truth as _rmse_against_truth,
+)
+from src.core.forecast import (
+    build_window_Xn as _build_window_Xn,
+    latest_contiguous_anchor as _latest_contiguous_anchor,
+    predict_7_abs as _predict_7_abs,
+    today_utc7_date as _today_utc7_date,
+)
 
 # Live daily means from MRC API (cached)
 from src.live_mrc import get_recent_daily_cached
@@ -338,172 +357,8 @@ def _load_upstream_daily_csv(path: str) -> Optional[pd.Series]:
     return s
 
 # -----------------------------------------------------------------------------
-# Upstream-assist model fitting / application (shared by Tab1 & Tab2)
+# Upstream-assist core helpers are imported from src.core.assist.
 # -----------------------------------------------------------------------------
-def _fit_3s_residual_model(
-    df_backtest: pd.DataFrame,
-    w3s_daily: pd.Series,
-    k_grid=(0, 1, 2, 3, 4, 5),
-    wet_months=None,
-):
-    """
-    Fit a wet-season residual correction using upstream daily level and its first
-    difference (Δlevel), scanning an integer lag `k` (days).
-
-    Model form (standardized features):
-        err ≈ a + b1 * z(level) + b2 * z(diff)
-
-    Where:
-    - err = h_true - h_pred  (residual on the target station)
-    - upstream features are taken at (date - k)
-
-    Notes:
-    - Fit is restricted to wet-season months.
-    - Uses ridge regression with small L2 for stability.
-
-    Args:
-        df_backtest:
-            Backtest rows with columns: date, h_true, h_pred (and/or err).
-        w3s_daily:
-            Upstream station daily mean series.
-        k_grid:
-            Candidate lags to scan (days).
-        wet_months:
-            Iterable months treated as wet season (defaults to WET_MONTHS).
-
-    Returns:
-        dict | None:
-            Best-fit parameter bundle, or None if insufficient samples.
-    """
-    if wet_months is None:
-        wet_months = WET_MONTHS
-
-    df = df_backtest.copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df["err"] = df["h_true"] - df["h_pred"]
-
-    # Wet-season only.
-    df = df[df["date"].map(lambda d: d.month in set(wet_months))].copy()
-
-    if df.empty or w3s_daily is None or len(w3s_daily) == 0:
-        return None
-
-    w3s_lvl = w3s_daily
-    w3s_d1  = w3s_daily.diff()
-
-    best = None
-    for k in k_grid:
-        X_list, y_list = [], []
-        for d, e in zip(df["date"], df["err"]):
-            lag = d - pd.Timedelta(days=k)
-            if (lag in w3s_lvl.index) and (lag in w3s_d1.index):
-                x1 = w3s_lvl.get(lag)
-                x2 = w3s_d1.get(lag)
-                if pd.notna(e) and pd.notna(x1) and pd.notna(x2):
-                    X_list.append([float(x1), float(x2)])
-                    y_list.append(float(e))
-        if len(X_list) < 40:
-            continue
-
-        X = np.asarray(X_list, np.float64)   # [N,2] -> [level, diff]
-        y = np.asarray(y_list, np.float64)   # [N]
-
-        # standardization + bias column
-        mu = X.mean(axis=0); sd = X.std(axis=0) + 1e-8
-        Xn = (X - mu) / sd
-        Xd = np.c_[np.ones(len(Xn)), Xn]     # [1, z1, z2]
-
-        # Ridge regression (small L2)
-        lam = 1e-3
-        A = Xd.T @ Xd + lam * np.eye(Xd.shape[1])
-        coef = np.linalg.solve(A, Xd.T @ y)   # [a, b1, b2]
-
-        yhat = Xd @ coef
-        rmse_resid = float(np.sqrt(np.mean((y - yhat) ** 2)))
-
-        cand = dict(
-            a=float(coef[0]),
-            b1=float(coef[1]),  # coefficient for the standardized level
-            b2=float(coef[2]),  # coefficient for the standardized difference
-            mu=mu.tolist(),
-            sd=sd.tolist(),
-            k=int(k),
-            n=len(y),
-            rmse_resid=rmse_resid,
-            months=list(wet_months),
-        )
-        if (best is None) or (rmse_resid < best["rmse_resid"]):
-            best = cand
-
-    if best:
-        print(f"[3S-fit] k={best['k']}, n={best['n']}, rmse_resid={best['rmse_resid']:.4f}, "
-              f"coef a={best['a']:.4f}, b1={best['b1']:.4f}, b2={best['b2']:.4f}")
-    else:
-        print("[3S-fit] not enough samples to fit")
-    return best
-
-def _apply_3s_correction(df_backtest: pd.DataFrame, w3s_daily: pd.Series, params: dict):
-    """
-    Apply an upstream residual correction to a backtest dataframe.
-
-    Policy:
-    - Apply only during wet-season months.
-    - Align upstream features by a learned lag `k` (days).
-    - Allow interpolation over tiny internal gaps (≤ 1 day) after reindexing.
-    - If upstream features are missing, apply delta=0 (keep baseline prediction).
-
-    Returns:
-      (y_corr, deltas):
-        y_corr: corrected predictions aligned to df_backtest['date']
-        deltas: additive correction applied to h_pred
-    """
-    if not params:
-        return np.full(len(df_backtest), np.nan), np.full(len(df_backtest), np.nan)
-
-    a  = float(params["a"])
-    b1 = float(params["b1"]); b2 = float(params["b2"])
-    mu = np.asarray(params["mu"], dtype=np.float64)   # [2] for [level, diff]
-    sd = np.asarray(params["sd"], dtype=np.float64)   # [2]
-    k  = int(params["k"])
-    wet_months = set(params.get("months", list(WET_MONTHS)))
-
-    # Align to the date index lagged by k days
-    # Allowing interpolation over gaps up to 1 day
-    dates = pd.to_datetime(df_backtest["date"]).dt.date
-    lag_dates = [d - pd.Timedelta(days=k) for d in dates]
-
-    # Reindex -> interpolate tiny gaps (≤ 1 day)
-    s_lvl = w3s_daily.reindex(lag_dates)
-    s_lvl = s_lvl.interpolate(limit=1, limit_area="inside").astype(float)
-
-    # Take the first difference and set the first NaN to 0
-    s_d1 = s_lvl.diff()
-    if len(s_d1) > 0:
-        first_valid = np.where(~pd.isna(s_d1))[0]
-        if len(first_valid):
-            s_d1.iloc[first_valid[0]] = 0.0
-
-    y_corr = []; deltas = []
-    for d, hp, x1, x2 in zip(dates, df_backtest["h_pred"], s_lvl.values, s_d1.values):
-        if pd.isna(hp):
-            y_corr.append(np.nan); deltas.append(np.nan); continue
-
-        # Dry season: keep baseline.
-        if d.month not in wet_months:
-            y_corr.append(float(hp)); deltas.append(0.0); continue
-
-        # Wet season: apply when upstream features exist.
-        if pd.isna(x1) or pd.isna(x2):
-            delta = 0.0
-        else:
-            z = (np.array([float(x1), float(x2)]) - mu) / (sd + 1e-8)
-            delta = float(a + b1 * z[0] + b2 * z[1])
-
-        y_corr.append(float(hp + delta))
-        deltas.append(delta)
-
-    return np.array(y_corr, np.float32), np.array(deltas, np.float32)
-
 # -----------------------------------------------------------------------------
 # Assist-param cache and backtest cache: concurrency-safe on-disk artifacts
 # -----------------------------------------------------------------------------
@@ -783,185 +638,11 @@ def _load_service(force_reload: bool = False):
         return _APP_CACHE
 
 # =============================================================================
-# Upstream-assist fitting helpers (Tab1 forecast overlays)
+# Upstream-assist fitting helpers are imported from src.core.assist.
 # =============================================================================
-def _fit_pakse_params_for_tab1(runner, water_daily, pakse_daily, horizon_for_fit=1) -> Optional[dict]:
-    """
-    Fit a wet-season residual-correction model using upstream Pakse daily series.
-
-    Intent:
-    - Produce a parameter bundle compatible with `_apply_upstream_correction_future()`
-      for Tab1's future-window overlay.
-
-    Policy:
-    - Fit is restricted to wet-season months (WET_MONTHS).
-    - Lag k is selected by scanning a small integer grid and minimizing residual RMSE.
-    - Fit data are derived from a k-day-ahead backtest window (constructed from history only).
-
-    Returns:
-        Optional[dict]:
-            Parameter dictionary (same schema as `_fit_3s_residual_model`) or None if insufficient data.
-    """
-    if pakse_daily is None or len(pakse_daily) == 0:
-        return None
-    df_fit, _ = _backtest_ytd_1day(runner, water_daily, start="2025-01-01", horizon=horizon_for_fit)
-    if df_fit is None or len(df_fit) == 0:
-        return None
-    params_pk = _fit_3s_residual_model(df_fit, pakse_daily, k_grid=(0, 1, 2, 3, 4, 5), wet_months=WET_MONTHS)
-    return params_pk
-
-def _fit_w3s_params_for_tab1(runner, water_daily, w3s_daily, horizon_for_fit=1):
-    """
-     Fit a wet-season residual-correction model using upstream 3S daily series.
-
-     Intent:
-     - Same as `_fit_pakse_params_for_tab1`, but uses the 3S station and a slightly smaller lag grid.
-
-     Policy:
-     - Wet-season only (WET_MONTHS).
-     - Select k by scanning a small grid and minimizing residual RMSE.
-
-     Returns:
-         Optional[dict]:
-             Parameter dictionary (same schema as `_fit_3s_residual_model`) or None if insufficient data.
-     """
-    if w3s_daily is None or len(w3s_daily) == 0:
-        return None
-    df_fit, _ = _backtest_ytd_1day(runner, water_daily, start="2025-01-01", horizon=horizon_for_fit)
-    if df_fit is None or len(df_fit) == 0:
-        return None
-    params_3s = _fit_3s_residual_model(df_fit, w3s_daily, k_grid=(0, 1, 2, 3), wet_months=WET_MONTHS)
-    return params_3s
-
-def _apply_upstream_correction_future(y_pred_7, fut_dates, upstream_daily, params, shrink_dry=DRY_SHRINK, allow_interp=True):
-    """
-    Apply an upstream residual-correction model to a future forecast window.
-
-    Intent:
-    - Take a baseline future forecast (e.g., 7-day FNO) and produce an adjusted series
-      using upstream level and Δlevel features at a learned lag k.
-
-    Policy / guardrails:
-    - Only use upstream values where lag_date <= today (UTC+07) to avoid “peeking” future upstream.
-    - Optional interpolation fills internal gaps <= 1 day after aligning to lag dates.
-    - Outside wet-season months, shrink the correction magnitude by `shrink_dry` ∈ [0, 1].
-
-    Returns:
-        (y_out, used, avail, k):
-          y_out: float32 array (n,), corrected forecast; NaN where correction cannot be applied
-                (NaN is intentional to break plot lines).
-          used:  bool array (n,), True where a correction was actually applied.
-          avail: int, number of usable corrected steps in this window.
-          k:     int | None, lag from params, or None if params unavailable.
-    """
-    n = len(fut_dates)
-    if not params or upstream_daily is None or len(upstream_daily) == 0:
-        return np.full(n, np.nan, np.float32), np.zeros(n, dtype=bool), 0, None
-
-    a  = float(params["a"])
-    b1 = float(params["b1"]); b2 = float(params["b2"])
-    mu = np.asarray(params["mu"], dtype=np.float64)
-    sd = np.asarray(params["sd"], dtype=np.float64)
-    k  = int(params["k"])
-    wet_months = set(params.get("months", list(WET_MONTHS)))
-
-    dates = pd.to_datetime(fut_dates).normalize().date
-    lag_dates = np.array([d - pd.Timedelta(days=k) for d in dates], dtype="object")
-
-    # Align upstream by lag; optionally fill tiny internal gaps to reduce “accidental NaN breaks”.
-    s_lvl = upstream_daily.reindex(lag_dates)
-    if allow_interp and len(s_lvl) > 0:
-        s_lvl = s_lvl.interpolate(limit=1, limit_area="inside")
-
-    # Disallow upstream values whose lag_date is in the future relative to UTC+07 “today”.
-    today = _today_utc7_date()
-    # Disable upstream values lag_date > today
-    for i, ld in enumerate(lag_dates):
-        if ld is None:
-            s_lvl.iloc[i] = np.nan
-            continue
-        d_ld = pd.to_datetime(ld)
-        if pd.isna(d_ld):
-            s_lvl.iloc[i] = np.nan
-            continue
-        if d_ld.date() > today:
-            s_lvl.iloc[i] = np.nan
-
-    # Δlevel feature with a deterministic first value.
-    s_d1 = s_lvl.diff()
-    if len(s_d1) > 0:
-        first_valid = np.where(~pd.isna(s_d1))[0]
-        if len(first_valid):
-            s_d1.iloc[first_valid[0]] = 0.0
-
-    y_out  = np.array(y_pred_7, dtype=np.float32).copy()
-    used   = np.zeros(n, dtype=bool)
-
-    for i, (d, hp, x1, x2) in enumerate(zip(dates, y_pred_7, s_lvl.values, s_d1.values)):
-        if pd.isna(hp) or pd.isna(x1) or pd.isna(x2):
-            # Unavailable: set NaN (plot line break) rather than silently keeping baseline.
-            y_out[i] = np.nan
-            continue
-
-        z = (np.array([float(x1), float(x2)]) - mu) / (sd + 1e-8)
-        delta = float(a + b1 * z[0] + b2 * z[1])
-        if d.month not in wet_months:
-            delta *= float(shrink_dry)
-        y_out[i] = float(hp + delta)
-        used[i] = True
-
-    avail = int(used.sum())
-    return y_out, used, avail, k
-
 # =============================================================================
-# Anchor selection (robust window end-date selection)
+# Forecast core helpers are imported from src.core.forecast.
 # =============================================================================
-def _latest_contiguous_anchor(water_daily: pd.Series, need: int = 120) -> pd.Timestamp.date:
-    """
-    Find the most recent contiguous run of valid daily observations and return the anchor date.
-
-    Intent:
-    - The model input window requires a dense daily calendar with no NaNs within the last `need` days.
-      This helper chooses an anchor at the end of the latest gap-free run to avoid tail-end holes.
-
-    Args:
-        water_daily:
-            Daily water level series (index: Python date, values: float).
-        need:
-            Required length (calendar days) of a contiguous, valid (non-NaN) block.
-
-    Returns:
-        datetime.date:
-            Anchor date (end of the contiguous block) suitable for window building.
-
-    Raises:
-        ValueError:
-            If there is no contiguous block of length >= `need`.
-    """
-    if len(water_daily) < need:
-        raise ValueError(f"Not enough data for a {need}-day window (currently {len(water_daily)} days).")
-
-    # Collect only dates with non-NaN values
-    valid_dates = {d for d, v in water_daily.items() if pd.notna(v)}
-
-    # Use Timestamp to step back day by day conveniently
-    idx = pd.to_datetime(list(water_daily.index))
-    d = idx.max().normalize()
-
-    run = 0
-    while d.date() >= idx.min().date():
-        if d.date() in valid_dates:
-            run += 1
-            if run >= need:
-                # Scanning backwards: when run hits `need`, `d` is the start of the run.
-                # Anchor is the end (most recent day) of that run.
-                return (d + pd.Timedelta(days=need - 1)).date()
-        else:
-            run = 0
-        d -= pd.Timedelta(days=1)
-
-    raise ValueError(f"Not enough contiguous data for {need} days.")
-
 # LIVE_CACHE   = os.path.join(RUNTIME_CACHE_DIR, "live_recent_daily.json")
 
 def _find_ckpt(weights_dir=WEIGHTS_DIR):
@@ -985,244 +666,23 @@ def _find_ckpt(weights_dir=WEIGHTS_DIR):
     raise FileNotFoundError("No TF checkpoint found in 'weights/'")
 
 # =============================================================================
-# Time utilities (UTC+07 calendar alignment)
+# Time utilities are imported from src.core.forecast.
 # =============================================================================
-def _today_utc7_date():
-    """
-    Return today's calendar date in UTC+07 (Asia/Bangkok), with a safe fallback.
-
-    Rationale:
-    - Station daily aggregation and “today” semantics are aligned to UTC+07.
-    - Using a consistent day boundary avoids off-by-one issues around UTC midnight.
-
-    Returns:
-        datetime.date: Today's date in Asia/Bangkok when available; otherwise UTC date.
-    """
-    try:
-        tz = ZoneInfo("Asia/Bangkok")
-        return pd.Timestamp.now(tz=tz).date()
-    except Exception:
-        return pd.Timestamp.utcnow().date()
-
 # =============================================================================
-# Input normalization (training parity)
+# Input normalization is implemented in src.core.forecast.
 # =============================================================================
-def _norm_inputs_like_train(X, st):
-    """
-    Normalize input features using the same statistics as training.
-
-    Contract:
-    - X has shape [batch, seq_len, n_features].
-    - The feature channels at indices 0, 2, 3 correspond to:
-        0: time index
-        2: input water level
-        3: Δ water level
-
-    Returns:
-        np.ndarray: Normalized copy of X.
-    """
-    Xn = X.copy()
-    Xn[:, :, 0] = (Xn[:, :, 0] - st['t_mean']) / (st['t_std'] + 1e-8)
-    Xn[:, :, 2] = (Xn[:, :, 2] - st['h_in_mean']) / (st['h_in_std'] + 1e-8)
-    Xn[:, :, 3] = (Xn[:, :, 3] - st['dh_in_mean']) / (st['dh_in_std'] + 1e-8)
-    return Xn
-
 # =============================================================================
-# Window builder (model input tensor assembly)
+# Window building is implemented in src.core.forecast.
 # =============================================================================
-def _build_window_Xn(runner, water_daily: pd.Series, date_anchor: pd.Timestamp):
-    """
-    Construct the model input window ending at `date_anchor` and normalize it like training.
-
-    Contract:
-    - Window length is exactly `SEQ_LENGTH`.
-    - Uses a no-leap calendar (Feb 29 is skipped) to match training conventions.
-    - Any missing/NaN within the window is treated as a hard failure (caller surfaces UI error).
-
-    Returns:
-        (Xn, fut_dates):
-          Xn: float32 array of shape (1, SEQ_LENGTH, 6), normalized.
-          fut_dates: DatetimeIndex of length `PRED_LENGTH`, Feb 29 removed and padded if needed.
-    """
-    date_anchor = pd.to_datetime(date_anchor).normalize()
-    L = int(SEQ_LENGTH)
-
-    # Collect L days backward from the anchor (skip Feb 29 to match training calendar).
-    days = []
-    d = date_anchor
-    while len(days) < L:
-        if not (d.month == 2 and d.day == 29):
-            days.append(d)
-        d -= pd.Timedelta(days=1)
-    days = days[::-1]  # ascending order
-
-    # Feature channel 0: time index in a no-leap day count (relative to runner.train_years[0]).
-    def _time_idx_for_date(dt: pd.Timestamp) -> int:
-        base = pd.Timestamp(f"{runner.train_years[0]}-01-01")
-        all_days = pd.date_range(base, dt, freq='D')
-        all_days = all_days[~((all_days.month==2) & (all_days.day==29))]
-        return len(all_days) - 1
-
-    # Feature channels 2/3: h and Δh (hard fail if window contains missing).
-    h_vals = []
-    for dt in days:
-        key = getattr(dt, "date", lambda: dt)()
-        # If a date is missing from the index or its value is NaN, treat it as missing.
-        if (key not in water_daily.index) or pd.isna(water_daily[key]):
-            raise ValueError(
-                f"Missing water level for {dt.date()} (NaN or absent), need continuous daily series with valid values."
-            )
-        h_vals.append(float(water_daily[key]))
-    h_vals = np.asarray(h_vals, np.float32)
-    dh1 = np.concatenate([[0.0], np.diff(h_vals)]).astype(np.float32)
-
-    # Remaining channels: x_pos (constant 0), seasonal sin/cos.
-    t_idx = np.asarray([_time_idx_for_date(dt) for dt in days], np.float32)
-    x_pos = np.zeros_like(t_idx, np.float32)
-    doy_sin, doy_cos = doy_sin_cos_series(days)
-
-    feats6 = np.stack([t_idx, x_pos, h_vals, dh1, doy_sin, doy_cos], axis=1).astype(np.float32)
-
-    # Normalize with training stats.
-    st = runner.norm_stats
-    Xn = feats6.copy()[None, :, :]
-    Xn[:, :, 0] = (Xn[:, :, 0] - st['t_mean'])   / (st['t_std'] + 1e-8)
-    Xn[:, :, 2] = (Xn[:, :, 2] - st['h_in_mean'])/ (st['h_in_std'] + 1e-8)
-    Xn[:, :, 3] = (Xn[:, :, 3] - st['dh_in_mean'])/(st['dh_in_std'] + 1e-8)
-
-    # Build future dates (no-leap). Pad if Feb 29 removal shortens the horizon.
-    fut_dates = pd.date_range(date_anchor + pd.Timedelta(days=1), periods=PRED_LENGTH, freq='D')
-    fut_dates = fut_dates[~((fut_dates.month==2) & (fut_dates.day==29))]
-    while len(fut_dates) < PRED_LENGTH:
-        fut_dates = fut_dates.append(fut_dates[-1:] + pd.Timedelta(days=1))
-        fut_dates = fut_dates[~((fut_dates.month==2) & (fut_dates.day==29))]
-    return Xn, fut_dates
-
 # =============================================================================
-# Inference core (forecast generation + uncertainty options)
+# Forecast inference wrappers are implemented in src.core.forecast.
 # =============================================================================
-def _predict_7_abs(runner, Xn, fut_dates, training=False):
-    """
-    Run the model forward to obtain absolute water levels for the future horizon.
-
-    Model output semantics:
-    - Model predicts standardized anomalies (z-scores) per horizon step.
-    - De-standardize with (h_std, h_mean) then add per-day climatology (no-leap DOY index).
-
-    Args:
-        training:
-            If True, keeps dropout active for MC Dropout sampling.
-
-    Returns:
-        np.ndarray: float32 array shape (PRED_LENGTH,), absolute water levels in meters.
-    """
-    y_pred_n = runner.model(Xn, training=training).numpy()  # [1,7,1]
-    st = runner.norm_stats
-    y_pred_anom = (y_pred_n * st['h_std'] + st['h_mean'])[0, :, 0]  # [7]
-
-    doys = [doy_no_leap(pd.to_datetime(d).normalize()) for d in fut_dates]
-    clim_add = np.array([float(runner.clim[d]) for d in doys], dtype=np.float32)
-    return (y_pred_anom + clim_add).astype(np.float32)
-
 # =============================================================================
-# Backtest core (k-day ahead YTD evaluation)
+# Backtest core is implemented in src.core.backtest.
 # =============================================================================
-def _backtest_ytd_1day(runner, water_daily, start="2025-01-01", end=None, horizon=1):
-    """
-    Run a k-day-ahead backtest over a date range (default: 2025-01-01 → today, UTC+07).
-
-    Evaluation protocol:
-    - Prediction for day T uses only observations up to anchor day (T - k).
-    - No recursive feeding of predicted values back into inputs.
-
-    Returns:
-        (df, rmse):
-          df columns: date (target T), h_true, h_pred, err (h_pred - h_true)
-          rmse: float | None
-    """
-    if end is None:
-        end = _today_utc7_date()
-    start = pd.to_datetime(start).date()
-    end   = pd.to_datetime(end).date()
-
-    k = int(horizon)
-    if not (1 <= k <= PRED_LENGTH):
-        raise ValueError(f"horizon must be in [1,{PRED_LENGTH}], got {horizon}")
-
-    dates = pd.date_range(start, end, freq="D").date
-    preds, trues, out_dates = [], [], []
-
-    for T in dates:
-        # No-leap parity with training/inference.
-        if T.month == 2 and T.day == 29:
-            continue
-        anchor = pd.Timestamp(T) - pd.Timedelta(days=k)
-
-        # Skip if anchor/target missing or NaN.
-        if (anchor.date() not in water_daily.index) or (T not in water_daily.index):
-            continue
-        if pd.isna(water_daily[anchor.date()]) or pd.isna(water_daily[T]):
-            continue
-        try:
-            Xn, fut_dates = _build_window_Xn(runner, water_daily, anchor)
-        except Exception:
-            continue
-
-        y_abs = _predict_7_abs(runner, Xn, fut_dates, training=False)  # [7]
-        predk = float(y_abs[k - 1])  # k-day ahead
-        true  = float(water_daily[T])
-
-        out_dates.append(pd.to_datetime(T))
-        preds.append(predk)
-        trues.append(true)
-
-    df = pd.DataFrame({"date": out_dates, "h_true": trues, "h_pred": preds})
-    if len(df):
-        df["err"] = df["h_pred"] - df["h_true"]
-        rmse = float(np.sqrt(np.mean(df["err"]**2)))
-    else:
-        rmse = None
-    return df, rmse
-
 # =============================================================================
-# Persistence baseline predictions and RMSE to backtest
+# Persistence baseline core is implemented in src.core.backtest.
 # =============================================================================
-def _attach_persistence_backtest(df_backtest: pd.DataFrame, water_daily: pd.Series, horizon: int):
-    """
-    Attach a k-day-ahead persistence baseline to an existing backtest dataframe.
-
-    For a target date T, the persistence prediction is the last observed level
-    available at the anchor date (T - horizon).
-
-    Returns:
-        (df_out, rmse_pers):
-          df_out: copy of df_backtest with column 'h_pred_Pers'
-          rmse_pers: RMSE of the persistence baseline on rows where both truth and
-                     persistence prediction are finite
-    """
-    if df_backtest is None or len(df_backtest) == 0:
-        return df_backtest, None
-
-    df = df_backtest.copy()
-    k = int(horizon)
-
-    pers_vals = []
-    for d in pd.to_datetime(df["date"]).dt.date:
-        anchor = pd.Timestamp(d) - pd.Timedelta(days=k)
-        key = anchor.date()
-        v = water_daily.get(key, np.nan)
-        pers_vals.append(float(v) if pd.notna(v) else np.nan)
-
-    df["h_pred_Pers"] = np.asarray(pers_vals, dtype=np.float32)
-
-    mask = np.isfinite(df["h_pred_Pers"].values) & np.isfinite(df["h_true"].values)
-    if mask.sum() > 0:
-        rmse_pers = float(np.sqrt(np.mean((df.loc[mask, "h_pred_Pers"].values - df.loc[mask, "h_true"].values) ** 2)))
-    else:
-        rmse_pers = None
-
-    return df, rmse_pers
-
 # =============================================================================
 # Tab2 note / metrics summary helpers
 # =============================================================================
@@ -1232,18 +692,6 @@ EVAL_METRIC_MODEL_ORDER = [
     "FNO + 3S",
     "FNO + Pakse",
 ]
-
-def _rmse_against_truth(y_true, y_pred):
-    """
-    Compute RMSE on rows where both truth and prediction are finite.
-    Returns None if there is no valid overlap.
-    """
-    yt = np.asarray(y_true, dtype=float)
-    yp = np.asarray(y_pred, dtype=float)
-    mask = np.isfinite(yt) & np.isfinite(yp)
-    if mask.sum() == 0:
-        return None
-    return float(np.sqrt(np.mean((yp[mask] - yt[mask]) ** 2)))
 
 def _build_eval_metrics_summary(metrics_map: dict) -> pd.DataFrame:
     """
@@ -1300,34 +748,6 @@ def _build_eval_note(
 # =============================================================================
 # Tab2 advanced diagnostics (availability-aware comparisons & routing)
 # =============================================================================
-def _mae_against_truth(y_true, y_pred):
-    """
-    Compute MAE on rows where both truth and prediction are finite.
-    Returns None if there is no valid overlap.
-    """
-    yt = np.asarray(y_true, dtype=float)
-    yp = np.asarray(y_pred, dtype=float)
-    mask = np.isfinite(yt) & np.isfinite(yp)
-    if mask.sum() == 0:
-        return None
-    return float(np.mean(np.abs(yp[mask] - yt[mask])))
-
-
-def _upstream_raw_available_mask(dates, upstream_daily: pd.Series, k: int):
-    """
-    Raw availability mask used for fair subset comparison.
-
-    Definition:
-    - A source is considered 'available' on target date T if the lag-aligned
-      upstream date (T - k) exists in the upstream series index and is finite.
-    """
-    lag_dates = np.array([d - pd.Timedelta(days=int(k)) for d in dates], dtype="object")
-    return np.array(
-        [(ld in upstream_daily.index) and pd.notna(upstream_daily.get(ld)) for ld in lag_dates],
-        dtype=bool,
-    )
-
-
 def _prepare_assist_eval_bundle(horizon=1):
     """
     Build a shared evaluation bundle for:

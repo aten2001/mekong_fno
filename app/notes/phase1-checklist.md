@@ -1,0 +1,6 @@
+- [ ] src/core
+- [ ] src/data
+- [ ] src/storage
+- [ ] src/jobs
+- [ ] app/gradio_app.py
+- [ ] app/fastapi_app.py
