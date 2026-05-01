@@ -41,7 +41,7 @@ sys.path.insert(0, ROOT)
 # Imports
 # =============================================================================
 # Standard library
-import json, glob, io, time, threading
+import json, glob, time, threading
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -85,10 +85,14 @@ from src.core.forecast import (
     predict_7_abs as _predict_7_abs,
     today_utc7_date as _today_utc7_date,
 )
+from src.data.historical import load_runner_history_daily
+from src.data.live import fetch_live_daily_series
+from src.data.merge import build_target_daily_series, merge_upstream_daily_series
+from src.data.upstream import load_upstream_daily_csv
+from src.data.validation import recent_missing_dates, stable_live_daily_until
 
 # Live daily means from MRC API (cached)
-from src.live_mrc import get_recent_daily_cached
-from src.backfill import read_backfill, write_backfill, series_from_any
+from src.backfill import read_backfill, series_from_any
 
 # =============================================================================
 # Global configuration / constants
@@ -227,135 +231,8 @@ def _resolve_eval_layers(comparison_mode: str, use_custom_layers: bool, selected
     return ordered or DEFAULT_EVAL_LAYERS
 
 # =============================================================================
-# Data utilities
+# Data loading and merge helpers are imported from src.data.
 # =============================================================================
-def _merge_hist_and_live_no_gaps(water_daily_hist: pd.Series,
-                                 live_daily: Optional[pd.Series],
-                                 fill_small_holes: bool = True) -> pd.Series:
-    """
-    Merge two daily series with "live takes precedence" semantics, then reindex to a
-    full daily calendar. Optionally fill only tiny internal gaps (≤ 1 day).
-
-    Design intent:
-    - Historical data provides long-term continuity.
-    - Live/backfill data overwrites the tail (and may extend it).
-    - A dense daily calendar is required for window-based forecasting.
-
-    Args:
-        water_daily_hist:
-            Historical daily water level series (index: python date-like).
-        live_daily:
-            Optional "live/backfill" daily series to merge on top of history.
-        fill_small_holes:
-            If True, fill at most 1-day internal gaps (never extrapolate endpoints).
-
-    Returns:
-        pandas.Series:
-            Continuous daily series (index: Python `date`, values: float meters).
-    """
-    def _to_dt_index(s: Optional[pd.Series]) -> pd.Series:
-        if s is None or len(s) == 0:
-            return pd.Series(dtype=float)
-        idx = pd.to_datetime(list(s.index))
-        return pd.Series(s.values, index=idx, dtype=float).sort_index()
-
-    wd = _to_dt_index(water_daily_hist)
-    if live_daily is not None and len(live_daily) > 0:
-        live = _to_dt_index(live_daily)
-        # For overlapping days, prefer live values (overwrite same-day entries).
-        wd = pd.concat([wd, live]).groupby(level=0).last().sort_index()
-
-    if len(wd) == 0:
-        return pd.Series(dtype=float)
-
-    # Reindex to a full daily calendar.
-    full = pd.date_range(wd.index.min(), wd.index.max(), freq="D")
-    wd = wd.reindex(full)
-
-    # Fill only small internal gaps; keep endpoints untouched.
-    if fill_small_holes:
-        wd = wd.interpolate(limit=1, limit_area="inside")
-
-    # Return index as Python date for compatibility with existing code paths.
-    return pd.Series(wd.values, index=wd.index.date)
-
-def _load_upstream_daily_csv(path: str) -> Optional[pd.Series]:
-    """
-    Load an upstream-station CSV and produce a daily-mean series.
-
-    Behavior:
-    - Parse timestamp column (best-effort matching).
-    - Convert/localize to Asia/Bangkok (UTC+07).
-    - Drop invalid timestamps.
-    - Group by local calendar day -> daily mean.
-    - Reindex to full daily calendar and fill tiny internal gaps (≤ 1 day).
-
-    Args:
-        path:
-            Filesystem path to the station CSV.
-
-    Returns:
-        pandas.Series | None:
-            Daily mean water level series (index: Python `date`, values: float),
-            or None if the CSV doesn't exist / cannot be parsed meaningfully.
-    """
-    if not os.path.exists(path):
-        print(f"[3S] file not found: {path}")
-        return None
-
-    df = pd.read_csv(path)
-    cols = {c.lower(): c for c in df.columns}
-
-    # Column matching: timestamp
-    for k in ["timestamp (utc+07:00)", "timestamp", "ts", "datetime", "date", "time"]:
-        if k in cols:
-            tcol = cols[k]; break
-    else:
-        tcol = df.columns[0]
-
-    # Column matching: numeric value
-    for k in ["value", "h", "w", "water_level", "level"]:
-        if k in cols:
-            vcol = cols[k]; break
-    else:
-        num_cols = df.select_dtypes(include="number").columns
-        if len(num_cols) == 0:
-            print("[3S] no numeric column found")
-            return None
-        vcol = num_cols[0]
-
-    raw = df[tcol].astype(str)
-
-    # Detect whether timestamps include timezone info.
-    has_tz_token = raw.str.contains(r'Z|[+-]\d{2}:\d{2}$', regex=True, na=False).any()
-    if has_tz_token:
-        ts = pd.to_datetime(raw, errors="coerce", utc=True).dt.tz_convert("Asia/Bangkok")
-    else:
-        ts = pd.to_datetime(raw, errors="coerce")
-        ts = ts.dt.tz_localize("Asia/Bangkok")  # treat raw as already-local time
-
-    df = df.loc[ts.notna()].copy()
-    df["_ts_local"] = ts.dropna()
-    # aggregate by local calendar days
-    df["_date_local"] = df["_ts_local"].dt.date
-
-    # Daily mean aggregation.
-    s = df.groupby("_date_local")[vcol].mean().astype(float)
-    # use python date as the index
-    s.index = pd.Index(s.index, dtype="object")
-    s = s.sort_index()
-
-    print(f"[3S] daily series ready: len={len(s)}, range={min(s.index) if len(s) else None}→{max(s.index) if len(s) else None}")
-
-    # Fill tiny internal gaps to prevent plot breaks / window failures.
-    if len(s):
-        full = pd.date_range(min(s.index), max(s.index), freq="D").date
-        s = s.reindex(full)  # generate the complete daily calendar
-        s = s.interpolate(limit=1, limit_area="inside")  # fill at most 1 day for internal gaps
-        s = s.astype(float)
-
-    return s
-
 # -----------------------------------------------------------------------------
 # Upstream-assist core helpers are imported from src.core.assist.
 # -----------------------------------------------------------------------------
@@ -471,7 +348,7 @@ def _load_service(force_reload: bool = False):
         new_cache: dict = {}
 
         runner = TenYearUnifiedRunner(CSV_DIR, seq_length=SEQ_LENGTH, pred_length=PRED_LENGTH)
-        data = runner.load_range_data(2015, 2025, allow_missing_u=True)
+        water_daily_hist = load_runner_history_daily(runner, 2015, 2025, allow_missing_u=True)
 
         # Training-time artifacts: climatology + normalization stats
         runner.set_climatology(np.load(CLIM_PATH))
@@ -490,50 +367,26 @@ def _load_service(force_reload: bool = False):
         # ---------------------------------------------------------------------
         # Target station: build daily mean series from history + backfill + live
         # ---------------------------------------------------------------------
-        df = pd.DataFrame(data, columns=['time_idx','x_pos','u','h','ts'])
-        df['date'] = pd.to_datetime(df['ts']).dt.date
-        water_daily_hist = df.groupby('date')['h'].mean()
-
         # read historical backfill (Parquet)
         backfill = read_backfill(BACKFILL_PATH)
 
         # fetch live daily means
-        live_daily = None
-        try:
-            live_daily = get_recent_daily_cached(
-                station_code=STATION_CODE,
-                cache_path=LIVE_CACHE,
-                ttl_seconds=900,
-            )
-        except Exception as e:
-            print("[app] live fetch skipped:", e)
+        live_daily = fetch_live_daily_series(
+            station_code=STATION_CODE,
+            cache_path=LIVE_CACHE,
+            ttl_seconds=900,
+            error_label="[app] live fetch skipped",
+        )
 
-        live_daily = series_from_any(live_daily)
-        backfill = series_from_any(backfill) if backfill is not None else None
-
-        wd = _merge_hist_and_live_no_gaps(water_daily_hist, backfill, fill_small_holes=True)
-        water_daily = _merge_hist_and_live_no_gaps(wd, live_daily, fill_small_holes=True)
+        water_daily = build_target_daily_series(water_daily_hist, backfill, live_daily)
 
         # ---------------------------------------------------------------------------------------
         # Persist “stable” part of live data into backfill (<= today-1).
         # Rationale: avoid repeated API calls for old days; treat yesterday and earlier as stable.
         # ---------------------------------------------------------------------------------------
         try:
-            stable = None
-            if live_daily is not None and len(live_daily) > 0:
-                cutoff = (pd.Timestamp(_today_utc7_date()) - pd.Timedelta(days=1))
-
-                stable_idx = [
-                    d for d, v in live_daily.items()
-                    if pd.notna(v) and pd.Timestamp(d) <= cutoff
-                ]
-
-                if len(stable_idx) > 0:
-                    stable = pd.Series(
-                        [live_daily[d] for d in stable_idx],
-                        index=pd.Index(stable_idx, dtype="object"),
-                        dtype=float
-                    ).sort_index()
+            cutoff = (pd.Timestamp(_today_utc7_date()) - pd.Timedelta(days=1))
+            stable = stable_live_daily_until(live_daily, cutoff)
 
             if stable is not None and len(stable) > 0:
                 # Lock on the canonical backfill parquet path to prevent concurrent writes.
@@ -556,24 +409,14 @@ def _load_service(force_reload: bool = False):
         # ---------------------------------------------------------------------
         # Upstream stations: 3S and Pakse (CSV history + live API tail)
         # ---------------------------------------------------------------------
-        w3s_hist = _load_upstream_daily_csv(W3S_CSV)
-
-        live_3s = None
-        try:
-            live_3s = get_recent_daily_cached(
-                station_code=W3S_CODE,
-                cache_path=LIVE_CACHE_3S,
-                ttl_seconds=900,
-            )
-        except Exception as e:
-            print("[3S] live fetch skipped:", e)
-
-        live_3s = series_from_any(live_3s)
-
-        if w3s_hist is not None and len(w3s_hist) > 0:
-            w3s_daily = _merge_hist_and_live_no_gaps(w3s_hist, live_3s, fill_small_holes=True)
-        else:
-            w3s_daily = series_from_any(live_3s)
+        w3s_hist = load_upstream_daily_csv(W3S_CSV)
+        live_3s = fetch_live_daily_series(
+            station_code=W3S_CODE,
+            cache_path=LIVE_CACHE_3S,
+            ttl_seconds=900,
+            error_label="[3S] live fetch skipped",
+        )
+        w3s_daily = merge_upstream_daily_series(w3s_hist, live_3s)
 
         print(f"[3S] path={W3S_CSV} exists={os.path.exists(W3S_CSV)}")
         if w3s_daily is None or len(w3s_daily) == 0:
@@ -582,24 +425,14 @@ def _load_service(force_reload: bool = False):
             print(f"[3S] len={len(w3s_daily)}, range={min(w3s_daily.index)}→{max(w3s_daily.index)}")
 
         # Pakse daily series
-        pakse_hist = _load_upstream_daily_csv(PAKSE_CSV)
-
-        live_pakse = None
-        try:
-            live_pakse = get_recent_daily_cached(
-                station_code=PAKSE_CODE,
-                cache_path=LIVE_CACHE_PAKSE,
-                ttl_seconds=900,
-            )
-        except Exception as e:
-            print("[pakse] live fetch skipped:", e)
-
-        live_pakse = series_from_any(live_pakse)
-
-        if pakse_hist is not None and len(pakse_hist) > 0:
-            pakse_daily = _merge_hist_and_live_no_gaps(pakse_hist, live_pakse, fill_small_holes=True)
-        else:
-            pakse_daily = series_from_any(live_pakse)
+        pakse_hist = load_upstream_daily_csv(PAKSE_CSV)
+        live_pakse = fetch_live_daily_series(
+            station_code=PAKSE_CODE,
+            cache_path=LIVE_CACHE_PAKSE,
+            ttl_seconds=900,
+            error_label="[pakse] live fetch skipped",
+        )
+        pakse_daily = merge_upstream_daily_series(pakse_hist, live_pakse)
 
         if pakse_daily is not None and len(pakse_daily) > 0:
             print(f"[PAKSE] len={len(pakse_daily)}, range={min(pakse_daily.index)}→{max(pakse_daily.index)}")
@@ -624,9 +457,7 @@ def _load_service(force_reload: bool = False):
         ))
 
         # Debug: missing days in the recent tail (handled by interpolation/anchor selection)
-        full = pd.date_range(min(water_daily.index), max(water_daily.index), freq="D")
-        missing = set(full.date) - set(water_daily.index)
-        tail_missing = sorted([d for d in missing if d >= (max(water_daily.index) - pd.Timedelta(days=14)).date()])
+        tail_missing = recent_missing_dates(water_daily, days=14)
         if tail_missing:
             print(f"[app][warn] recent missing days auto-handled: {tail_missing}")
 
