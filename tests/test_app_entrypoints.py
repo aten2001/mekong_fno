@@ -20,8 +20,8 @@ def test_fastapi_entrypoint_importable_and_static_safe():
 
     assert callable(fastapi_app.create_fastapi_app)
     assert fastapi_app.live_payload() == {"status": "ok"}
-    assert fastapi_app.ready_payload()["ready"] is False
-    assert fastapi_app.status_payload()["forecast_enabled"] is False
+    assert fastapi_app.ready_payload()["ready"] is True
+    assert fastapi_app.status_payload().ready is False
 
     source = Path(fastapi_app.__file__).read_text(encoding="utf-8").lower()
     blocked = (
@@ -29,6 +29,7 @@ def test_fastapi_entrypoint_importable_and_static_safe():
         "tensorflow",
         "load_weights",
         "_load_service",
+        "app.app",
     )
     for token in blocked:
         assert token not in source
@@ -46,9 +47,10 @@ def test_fastapi_health_routes_when_dependency_available():
     assert "/health/live" in routes
     assert "/health/ready" in routes
     assert "/status" in routes
+    assert "/forecast" in routes
     assert routes["/health/live"].endpoint() == {"status": "ok"}
-    assert routes["/health/ready"].endpoint()["ready"] is False
-    assert routes["/status"].endpoint()["service"] == "mekong-fno"
+    assert routes["/health/ready"].endpoint()["ready"] is True
+    assert routes["/status"].endpoint().service_status == "not_ready"
 
 
 def test_legacy_gradio_entrypoint_still_exists():
