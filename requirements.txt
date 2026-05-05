@@ -8,6 +8,7 @@ filelock>=3.12
 fastapi>=0.110,<1
 uvicorn>=0.29,<1
 httpx>=0.24,<1
+boto3>=1.34,<2
 
 typing-extensions>=4.8.0,<5
 

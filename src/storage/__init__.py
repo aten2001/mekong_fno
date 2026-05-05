@@ -2,10 +2,13 @@
 
 from src.storage.base import PathPart, RuntimeArea, StorageBackend
 from src.storage.local_storage import LocalStorageBackend
+from src.storage.s3_storage import S3ObjectRef, S3StorageBackend
 
 __all__ = [
     "LocalStorageBackend",
     "PathPart",
     "RuntimeArea",
+    "S3ObjectRef",
+    "S3StorageBackend",
     "StorageBackend",
 ]
