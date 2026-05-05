@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from src.storage.base import PathPart, RuntimeArea
+from src.storage.s3_keys import S3KeyBuilder, join_key
 
 
 @dataclass(frozen=True)
@@ -20,29 +20,9 @@ class S3ObjectRef:
         return f"s3://{self.bucket}/{self.key}"
 
 
-def _part_tokens(part: PathPart) -> list[str]:
-    raw = part.as_posix() if isinstance(part, Path) else str(part).replace("\\", "/")
-    raw = raw.strip()
-    if len(raw) >= 2 and raw[1] == ":":
-        raw = raw[2:]
-    raw = raw.strip("/")
-
-    tokens: list[str] = []
-    for token in raw.split("/"):
-        token = token.strip()
-        if not token or token == ".":
-            continue
-        if token == "..":
-            raise ValueError("S3 key parts must not contain '..'")
-        tokens.append(token)
-    return tokens
-
-
 def join_s3_key(prefix: str = "", *parts: PathPart) -> str:
-    tokens: list[str] = []
-    for part in (prefix, *parts):
-        tokens.extend(_part_tokens(part))
-    return "/".join(tokens)
+    """Backward-compatible wrapper around the centralized S3 key joiner."""
+    return join_key(prefix, *parts)
 
 
 class S3StorageBackend:
@@ -59,7 +39,8 @@ class S3StorageBackend:
         if not bucket:
             raise ValueError("bucket is required")
         self.bucket = bucket
-        self.prefix = join_s3_key(prefix)
+        self.key_builder = S3KeyBuilder(prefix=prefix)
+        self.prefix = self.key_builder.prefix
         self._provided_client = client
         self.region_name = region_name
         self._lazy_client: Any | None = None
@@ -77,7 +58,10 @@ class S3StorageBackend:
         return self._lazy_client
 
     def _key(self, *parts: PathPart) -> str:
-        return join_s3_key(self.prefix, *parts)
+        return self.key_builder.join_key(*parts)
+
+    def _ref_key(self, key: str) -> S3ObjectRef:
+        return S3ObjectRef(bucket=self.bucket, key=key)
 
     def _ref(self, *parts: PathPart) -> S3ObjectRef:
         return S3ObjectRef(bucket=self.bucket, key=self._key(*parts))
@@ -101,12 +85,14 @@ class S3StorageBackend:
         return S3ObjectRef(bucket=self.bucket, key=key)
 
     def resolve_model_path(self, *parts: PathPart, model_id: str | None = None) -> S3ObjectRef:
-        base = ("models", model_id) if model_id else ("models",)
-        return self._ref(*base, *parts)
+        if model_id is None:
+            return self._ref("models", *parts)
+        return self._ref_key(self.key_builder.model_key(model_id, *parts))
 
     def resolve_asset_path(self, *parts: PathPart, version: str | None = None) -> S3ObjectRef:
-        base = ("assets", version) if version else ("assets",)
-        return self._ref(*base, *parts)
+        if version is None:
+            return self._ref("assets", *parts)
+        return self._ref_key(self.key_builder.asset_key(version, *parts))
 
     def resolve_data_path(self, *parts: PathPart) -> S3ObjectRef:
         return self._ref("data", *parts)
@@ -117,16 +103,19 @@ class S3StorageBackend:
         station: str | None = None,
         area: RuntimeArea = "root",
     ) -> S3ObjectRef:
-        base: tuple[PathPart, ...]
-        if station:
-            base = ("runtime", station)
-        else:
-            base = ("runtime",)
-
         if area == "root":
-            return self._ref(*base, *parts)
-        if area in ("cache", "artifacts"):
-            return self._ref(*base, area, *parts)
+            if station:
+                key = self.key_builder.join_key("runtime", self.key_builder.safe_token(station), *parts)
+                return self._ref_key(key)
+            return self._ref("runtime", *parts)
+        if area == "cache":
+            if station:
+                return self._ref_key(self.key_builder.runtime_cache_key(station, *parts))
+            return self._ref("runtime", "cache", *parts)
+        if area == "artifacts":
+            if station:
+                return self._ref_key(self.key_builder.runtime_artifact_key(station, *parts))
+            return self._ref("runtime", "artifacts", *parts)
         raise ValueError(f"Unknown runtime area: {area!r}")
 
     def backtest_path(
@@ -135,16 +124,17 @@ class S3StorageBackend:
         station: str | None = None,
         model_id: str | None = None,
     ) -> S3ObjectRef:
-        base: list[PathPart] = ["backtests"]
         if station is not None:
-            base.append(station)
+            return self._ref_key(self.key_builder.backtest_artifact_key(station, *parts, model_id=model_id))
+        base: list[PathPart] = ["backtests"]
         if model_id is not None:
             base.append(model_id)
         return self._ref(*base, *parts)
 
     def snapshot_path(self, *parts: PathPart, snapshot_id: str | None = None) -> S3ObjectRef:
-        base = ("snapshots", snapshot_id) if snapshot_id else ("snapshots",)
-        return self._ref(*base, *parts)
+        if snapshot_id is None:
+            return self._ref("snapshots", *parts)
+        return self._ref_key(self.key_builder.snapshot_key(snapshot_id, *parts))
 
     def read_text(self, ref_or_key: S3ObjectRef | PathPart, *, encoding: str = "utf-8") -> str:
         ref = self._coerce_ref(ref_or_key)
