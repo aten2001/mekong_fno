@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -87,8 +88,19 @@ def test_status_returns_required_placeholder_fields_without_local_paths():
     if client is None:
         return
 
-    response = client.get("/status")
-    data = response.json()
+    old_active = os.environ.pop("ACTIVE_MODEL_ID", None)
+    old_manifest = os.environ.get("MODEL_MANIFEST_PATH")
+    os.environ["MODEL_MANIFEST_PATH"] = str(Path("missing_model_manifest_for_test.json").resolve())
+    try:
+        response = client.get("/status")
+        data = response.json()
+    finally:
+        if old_active is not None:
+            os.environ["ACTIVE_MODEL_ID"] = old_active
+        if old_manifest is None:
+            os.environ.pop("MODEL_MANIFEST_PATH", None)
+        else:
+            os.environ["MODEL_MANIFEST_PATH"] = old_manifest
 
     assert response.status_code == 200
     for field in [
@@ -107,6 +119,7 @@ def test_status_returns_required_placeholder_fields_without_local_paths():
         assert field in data
     assert data["ready"] is False
     assert data["service_status"] == "not_ready"
+    assert data["active_model_id"] is None
     assert data["backend_mode"] == "local"
     assert data["artifacts_ok"] is False
     assert data["upstream_status"] == {}
@@ -116,21 +129,51 @@ def test_status_returns_required_placeholder_fields_without_local_paths():
     assert "\\users\\" not in text
 
 
+def test_status_reports_active_model_id_from_env():
+    client = _client()
+    if client is None:
+        return
+
+    old_active = os.environ.get("ACTIVE_MODEL_ID")
+    os.environ["ACTIVE_MODEL_ID"] = "env_model_v1"
+    try:
+        response = client.get("/status")
+    finally:
+        if old_active is None:
+            os.environ.pop("ACTIVE_MODEL_ID", None)
+        else:
+            os.environ["ACTIVE_MODEL_ID"] = old_active
+
+    assert response.status_code == 200
+    assert response.json()["active_model_id"] == "env_model_v1"
+
+
 def test_forecast_accepts_valid_request_and_returns_placeholder_response():
     client = _client()
     if client is None:
         return
 
-    response = client.post(
-        "/forecast",
-        json={
-            "station": "014501",
-            "horizon": 3,
-            "mode": "live",
-            "include_backtest": False,
-            "include_uncertainty": True,
-        },
-    )
+    old_active = os.environ.pop("ACTIVE_MODEL_ID", None)
+    old_manifest = os.environ.get("MODEL_MANIFEST_PATH")
+    os.environ["MODEL_MANIFEST_PATH"] = str(Path("missing_model_manifest_for_test.json").resolve())
+    try:
+        response = client.post(
+            "/forecast",
+            json={
+                "station": "014501",
+                "horizon": 3,
+                "mode": "live",
+                "include_backtest": False,
+                "include_uncertainty": True,
+            },
+        )
+    finally:
+        if old_active is not None:
+            os.environ["ACTIVE_MODEL_ID"] = old_active
+        if old_manifest is None:
+            os.environ.pop("MODEL_MANIFEST_PATH", None)
+        else:
+            os.environ["MODEL_MANIFEST_PATH"] = old_manifest
     data = response.json()
 
     assert response.status_code == 200
@@ -146,6 +189,25 @@ def test_forecast_accepts_valid_request_and_returns_placeholder_response():
     assert all(point["lower"] is None and point["upper"] is None for point in data["predictions"])
     assert data["warnings"]
     assert "placeholder" in data["warnings"][0].lower()
+
+
+def test_forecast_placeholder_includes_active_model_id_from_env():
+    client = _client()
+    if client is None:
+        return
+
+    old_active = os.environ.get("ACTIVE_MODEL_ID")
+    os.environ["ACTIVE_MODEL_ID"] = "env_model_v1"
+    try:
+        response = client.post("/forecast", json={"station": "014501", "horizon": 2})
+    finally:
+        if old_active is None:
+            os.environ.pop("ACTIVE_MODEL_ID", None)
+        else:
+            os.environ["ACTIVE_MODEL_ID"] = old_active
+
+    assert response.status_code == 200
+    assert response.json()["model_id"] == "env_model_v1"
 
 
 def test_forecast_rejects_invalid_horizons():

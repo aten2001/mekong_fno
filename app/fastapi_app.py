@@ -12,6 +12,12 @@ from app.schemas import (
     RuntimeStatus,
     StatusResponse,
 )
+from src.model_manifest import (
+    default_model_manifest_path,
+    get_active_model_record,
+    load_model_manifest,
+    resolve_active_model_id,
+)
 
 
 API_TITLE = "Mekong FNO Forecast API"
@@ -33,24 +39,50 @@ def ready_payload() -> dict[str, Any]:
     }
 
 
+def _resolve_active_model_for_api() -> tuple[str | None, list[str]]:
+    active_model_id = resolve_active_model_id()
+    warnings: list[str] = []
+    if not active_model_id:
+        warnings.append("No active model is configured; set ACTIVE_MODEL_ID or model_manifest.active_model_id.")
+        return None, warnings
+
+    # Env overrides are allowed even when absent from the manifest. Manifest issues
+    # should never break this API skeleton or trigger model loading.
+    path = default_model_manifest_path()
+    if path.exists():
+        try:
+            manifest = load_model_manifest(path)
+            if get_active_model_record(manifest, active_model_id) is None:
+                warnings.append("Active model id is not present in the local model manifest.")
+        except Exception:
+            warnings.append("Model manifest could not be read; continuing with unresolved model record.")
+
+    return active_model_id, warnings
+
+
 def status_payload() -> StatusResponse:
+    active_model_id, model_warnings = _resolve_active_model_for_api()
     return StatusResponse(
         ready=False,
         service_status="not_ready",
         generated_at=_utc_now_iso(),
         latest_data_date=None,
         data_freshness_days=None,
-        active_model_id=None,
+        active_model_id=active_model_id,
         backend_mode="local",
         artifacts_ok=False,
         upstream_status={},
         runtime_status=RuntimeStatus(),
-        warnings=["Placeholder status response; real runtime readiness is not connected yet."],
+        warnings=[
+            "Placeholder status response; real runtime readiness is not connected yet.",
+            *model_warnings,
+        ],
     )
 
 
 def placeholder_forecast_payload(request: ForecastRequest) -> ForecastResponse:
     generated_at = _utc_now_iso()
+    active_model_id, model_warnings = _resolve_active_model_for_api()
     start = datetime.now().date()
     points = [
         ForecastPoint(
@@ -67,13 +99,16 @@ def placeholder_forecast_payload(request: ForecastRequest) -> ForecastResponse:
         horizon=request.horizon,
         generated_at=generated_at,
         latest_data_date=None,
-        model_id=None,
+        model_id=active_model_id,
         assist_enabled=False,
         uncertainty_available=False,
         predictions=points,
         metrics=None,
         backtest=None,
-        warnings=["Placeholder forecast response; real inference is not connected yet."],
+        warnings=[
+            "Placeholder forecast response; real inference is not connected yet.",
+            *model_warnings,
+        ],
     )
 
 

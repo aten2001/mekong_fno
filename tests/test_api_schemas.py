@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -73,10 +74,24 @@ def test_fastapi_payload_helpers_return_contract_shapes():
 
     import app.fastapi_app as fastapi_app
 
-    assert fastapi_app.live_payload() == {"status": "ok"}
-    assert fastapi_app.ready_payload() == {"ready": True, "status": "ok"}
+    old_active = os.environ.pop("ACTIVE_MODEL_ID", None)
+    old_manifest = os.environ.get("MODEL_MANIFEST_PATH")
+    os.environ["MODEL_MANIFEST_PATH"] = str(Path("missing_model_manifest_for_test.json").resolve())
+    try:
+        assert fastapi_app.live_payload() == {"status": "ok"}
+        assert fastapi_app.ready_payload() == {"ready": True, "status": "ok"}
+        status = fastapi_app.status_payload()
+        forecast = fastapi_app.placeholder_forecast_payload(
+            ForecastRequest(station="014501", horizon=4)
+        )
+    finally:
+        if old_active is not None:
+            os.environ["ACTIVE_MODEL_ID"] = old_active
+        if old_manifest is None:
+            os.environ.pop("MODEL_MANIFEST_PATH", None)
+        else:
+            os.environ["MODEL_MANIFEST_PATH"] = old_manifest
 
-    status = fastapi_app.status_payload()
     assert status.ready is False
     assert status.service_status == "not_ready"
     assert status.latest_data_date is None
@@ -85,9 +100,6 @@ def test_fastapi_payload_helpers_return_contract_shapes():
     assert status.artifacts_ok is False
     assert status.upstream_status == {}
 
-    forecast = fastapi_app.placeholder_forecast_payload(
-        ForecastRequest(station="014501", horizon=4)
-    )
     assert forecast.station == "014501"
     assert forecast.mode == "live"
     assert forecast.horizon == 4
@@ -135,7 +147,20 @@ def test_fastapi_health_status_and_forecast_routes_when_dependency_available():
     assert routes["/health/live"].endpoint() == {"status": "ok"}
     assert routes["/health/ready"].endpoint() == {"ready": True, "status": "ok"}
 
-    status = routes["/status"].endpoint()
+    old_active = os.environ.pop("ACTIVE_MODEL_ID", None)
+    old_manifest = os.environ.get("MODEL_MANIFEST_PATH")
+    os.environ["MODEL_MANIFEST_PATH"] = str(Path("missing_model_manifest_for_test.json").resolve())
+    try:
+        status = routes["/status"].endpoint()
+        forecast = routes["/forecast"].endpoint(ForecastRequest(station="014501", horizon=3))
+    finally:
+        if old_active is not None:
+            os.environ["ACTIVE_MODEL_ID"] = old_active
+        if old_manifest is None:
+            os.environ.pop("MODEL_MANIFEST_PATH", None)
+        else:
+            os.environ["MODEL_MANIFEST_PATH"] = old_manifest
+
     assert status.ready is False
     assert status.latest_data_date is None
     assert status.active_model_id is None
@@ -143,7 +168,6 @@ def test_fastapi_health_status_and_forecast_routes_when_dependency_available():
     assert status.artifacts_ok is False
     assert status.upstream_status == {}
 
-    forecast = routes["/forecast"].endpoint(ForecastRequest(station="014501", horizon=3))
     assert forecast.station == "014501"
     assert forecast.horizon == 3
     assert forecast.mode == "live"
