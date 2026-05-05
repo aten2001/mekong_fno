@@ -45,13 +45,13 @@ def status_payload() -> StatusResponse:
         artifacts_ok=False,
         upstream_status={},
         runtime_status=RuntimeStatus(),
-        warnings=["Forecast runtime is not connected to the FastAPI skeleton yet."],
+        warnings=["Placeholder status response; real runtime readiness is not connected yet."],
     )
 
 
 def placeholder_forecast_payload(request: ForecastRequest) -> ForecastResponse:
     generated_at = _utc_now_iso()
-    start = datetime.now(timezone.utc).date()
+    start = datetime.now().date()
     points = [
         ForecastPoint(
             date=(start + timedelta(days=offset)).isoformat(),
@@ -79,14 +79,7 @@ def placeholder_forecast_payload(request: ForecastRequest) -> ForecastResponse:
 
 def create_fastapi_app():
     """Create the minimal API app without loading model artifacts."""
-    try:
-        from fastapi import FastAPI
-    except ModuleNotFoundError as exc:
-        if exc.name == "fastapi":
-            raise RuntimeError(
-                "FastAPI is not installed. Install project dependencies before running the API app."
-            ) from exc
-        raise
+    from fastapi import FastAPI
 
     api = FastAPI(title=API_TITLE, version=API_VERSION)
 
@@ -109,7 +102,4 @@ def create_fastapi_app():
     return api
 
 
-try:
-    app = create_fastapi_app()
-except RuntimeError:
-    app = None
+app = create_fastapi_app()
