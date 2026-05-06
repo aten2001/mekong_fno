@@ -1,4 +1,6 @@
+import importlib
 import json
+import sys
 from pathlib import Path
 
 from src.model_manifest import (
@@ -203,3 +205,12 @@ def test_model_manifest_module_has_no_heavy_or_cloud_imports():
     )
     for token in blocked:
         assert token not in source
+
+    before = set(sys.modules)
+    import src.model_manifest as model_manifest
+
+    importlib.reload(model_manifest)
+    newly_imported = set(sys.modules) - before
+
+    for module_name in ("tensorflow", "gradio", "app.app", "boto3", "botocore"):
+        assert module_name not in newly_imported
