@@ -2,8 +2,9 @@
 
 Active model resolution priority:
 1. non-empty ``ACTIVE_MODEL_ID`` environment override
-2. ``active_model_id`` from the selected manifest file
-3. ``None`` when neither is configured
+2. ``active_model_id`` from the provided manifest file, when present
+3. ``active_model_id`` from the default manifest path, when no path is provided
+4. ``None`` when neither is configured
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ class ModelRecord:
     station: str | None = None
     horizon: int | None = None
     description: str | None = None
+    weights_key: str | None = None
     weights_path: str | None = None
     assets_version: str | None = None
     created_at: str | None = None
@@ -40,6 +42,7 @@ class ModelRecord:
             "station",
             "horizon",
             "description",
+            "weights_key",
             "weights_path",
             "assets_version",
             "created_at",
@@ -49,6 +52,7 @@ class ModelRecord:
             station=data.get("station"),
             horizon=data.get("horizon"),
             description=data.get("description"),
+            weights_key=data.get("weights_key"),
             weights_path=data.get("weights_path"),
             assets_version=data.get("assets_version"),
             created_at=data.get("created_at"),
@@ -61,6 +65,7 @@ class ModelRecord:
             "station": self.station,
             "horizon": self.horizon,
             "description": self.description,
+            "weights_key": self.weights_key,
             "weights_path": self.weights_path,
             "assets_version": self.assets_version,
             "created_at": self.created_at,
@@ -94,8 +99,11 @@ def default_model_manifest_path(env: Mapping[str, str] | None = None) -> Path:
     return repo_root / DEFAULT_MANIFEST_RELATIVE_PATH
 
 
-def load_model_manifest(path: Path) -> ModelManifest:
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+def load_model_manifest(path: Path | str) -> ModelManifest:
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid model manifest JSON: {path}") from exc
     if not isinstance(raw, dict):
         raise ValueError("model manifest root must be a JSON object")
 
@@ -119,7 +127,7 @@ def load_model_manifest(path: Path) -> ModelManifest:
     )
 
 
-def save_model_manifest(path: Path, manifest: ModelManifest) -> None:
+def save_model_manifest(path: Path | str, manifest: ModelManifest) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -129,7 +137,7 @@ def save_model_manifest(path: Path, manifest: ModelManifest) -> None:
 
 
 def resolve_active_model_id(
-    manifest_path: Path | None = None,
+    manifest_path: Path | str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str | None:
     """Resolve active model id from env first, then manifest, without hard failures."""

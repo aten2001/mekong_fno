@@ -123,6 +123,7 @@ def test_status_returns_required_placeholder_fields_without_local_paths():
     assert data["backend_mode"] == "local"
     assert data["artifacts_ok"] is False
     assert data["upstream_status"] == {}
+    assert any("active model" in warning.lower() for warning in data["warnings"])
     text = response.text.lower()
     assert "d:\\" not in text
     assert "/users/" not in text
@@ -189,6 +190,7 @@ def test_forecast_accepts_valid_request_and_returns_placeholder_response():
     assert all(point["lower"] is None and point["upper"] is None for point in data["predictions"])
     assert data["warnings"]
     assert "placeholder" in data["warnings"][0].lower()
+    assert any("active model" in warning.lower() for warning in data["warnings"])
 
 
 def test_forecast_placeholder_includes_active_model_id_from_env():
