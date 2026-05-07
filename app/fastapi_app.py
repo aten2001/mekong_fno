@@ -1,4 +1,10 @@
-"""Minimal FastAPI skeleton for a future API service boundary."""
+"""Minimal FastAPI skeleton for a future API service boundary.
+
+Online request handlers are read-only for shared runtime, status, backtest,
+snapshot, and manifest state. Scheduled jobs own shared state updates; this
+module may only build in-memory responses or use disposable local cache in a
+future step.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +28,19 @@ from src.model_manifest import (
 
 API_TITLE = "Mekong FNO Forecast API"
 API_VERSION = "0.1.0"
+ONLINE_API_SHARED_WRITES_ALLOWED = False
+READ_ONLY_STATE_WARNING = "Online API is read-only; shared runtime updates are produced by scheduled jobs."
+
+
+def online_shared_writes_allowed() -> bool:
+    """Return whether online request handlers may persist shared state."""
+    return ONLINE_API_SHARED_WRITES_ALLOWED
+
+
+def assert_online_read_only_operation(operation_name: str) -> None:
+    """Guard future online code paths from accidentally persisting shared state."""
+    if not online_shared_writes_allowed():
+        raise RuntimeError(f"Online API cannot persist shared state during {operation_name}.")
 
 
 def _utc_now_iso() -> str:
@@ -75,6 +94,7 @@ def status_payload() -> StatusResponse:
         runtime_status=RuntimeStatus(),
         warnings=[
             "Placeholder status response; real runtime readiness is not connected yet.",
+            READ_ONLY_STATE_WARNING,
             *model_warnings,
         ],
     )
@@ -107,6 +127,7 @@ def placeholder_forecast_payload(request: ForecastRequest) -> ForecastResponse:
         backtest=None,
         warnings=[
             "Placeholder forecast response; real inference is not connected yet.",
+            READ_ONLY_STATE_WARNING,
             *model_warnings,
         ],
     )
