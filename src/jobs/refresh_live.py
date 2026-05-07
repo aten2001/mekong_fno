@@ -13,6 +13,19 @@ import pandas as pd
 
 BACKFILL_FILENAME = "live_backfill.parquet"
 STATUS_FILENAME = "status.json"
+LATEST_INPUTS_FILENAME = "latest_inputs.json"
+LIVE_CACHE_FILENAME = "live_cache.json"
+
+
+def _artifact_label(ref) -> str:
+    return getattr(ref, "uri", str(ref))
+
+
+def _runtime_ref(storage, station_code: str, filename: str, *, area: str):
+    try:
+        return storage.runtime_path(filename, station=station_code, area=area)
+    except TypeError:
+        return storage.runtime_path(station_code, filename, area=area)
 
 
 def today_utc7_date():
@@ -112,6 +125,64 @@ def _build_status(*, station_code: str, rows: int, dmin, dmax, cutoff) -> dict[s
     }
 
 
+def _backfill_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    records = []
+    for row in df.itertuples(index=False):
+        records.append(
+            {
+                "date": str(pd.to_datetime(row.date).date()),
+                "h": float(row.h),
+            }
+        )
+    return records
+
+
+def _latest_inputs_payload(*, station_code: str, df: pd.DataFrame, latest_data_date: str | None) -> dict[str, Any]:
+    latest_value = None
+    if len(df):
+        latest_value = float(df.iloc[-1]["h"])
+    return {
+        "station_code": station_code,
+        "latest_data_date": latest_data_date,
+        "latest_value": latest_value,
+        "rows": int(len(df)),
+        "writer": "refresh_live_job",
+    }
+
+
+def _write_storage_runtime_artifacts(
+    *,
+    storage,
+    station_code: str,
+    df: pd.DataFrame,
+    status: dict[str, Any],
+) -> list[str]:
+    latest_data_date = status["range"][1]
+    latest_inputs = _latest_inputs_payload(
+        station_code=station_code,
+        df=df,
+        latest_data_date=latest_data_date,
+    )
+    live_cache = {
+        "station_code": station_code,
+        "latest_data_date": latest_data_date,
+        "rows": int(len(df)),
+        "records": _backfill_records(df),
+        "writer": "refresh_live_job",
+    }
+
+    refs = [
+        (_runtime_ref(storage, station_code, STATUS_FILENAME, area="artifacts"), status),
+        (_runtime_ref(storage, station_code, LATEST_INPUTS_FILENAME, area="artifacts"), latest_inputs),
+        (_runtime_ref(storage, station_code, LIVE_CACHE_FILENAME, area="cache"), live_cache),
+    ]
+    written: list[str] = []
+    for ref, payload in refs:
+        storage.write_json(ref, payload)
+        written.append(_artifact_label(ref))
+    return written
+
+
 def refresh_live_job(
     *,
     out_dir: str | Path = "out",
@@ -122,6 +193,9 @@ def refresh_live_job(
     ttl_seconds: int = 0,
     download_existing: bool = True,
     live_daily=None,
+    storage=None,
+    active_model_id: str | None = None,
+    backend_mode: str = "local",
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """
@@ -136,14 +210,21 @@ def refresh_live_job(
 
     if dry_run:
         return {
+            "ok": True,
             "dry_run": True,
             "station_code": station_code,
             "out_dir": str(out),
             "cache_path": str(cache),
             "files": [BACKFILL_FILENAME, STATUS_FILENAME],
+            "written": [],
+            "warnings": [],
+            "latest_data_date": None,
+            "active_model_id": active_model_id,
+            "backend_mode": backend_mode,
         }
 
-    out.mkdir(parents=True, exist_ok=True)
+    if storage is None or download_existing:
+        out.mkdir(parents=True, exist_ok=True)
 
     if download_existing and not repo_id:
         raise RuntimeError("HF_DATASET_REPO is missing")
@@ -167,9 +248,6 @@ def refresh_live_job(
     df_new = stable_live_rows(live_daily, cutoff)
     df_all = merge_backfill_frames(df_backfill, df_new)
 
-    out_backfill = out / BACKFILL_FILENAME
-    df_all.to_parquet(out_backfill, index=False)
-
     dmin = df_all["date"].dt.date.min() if len(df_all) else None
     dmax = df_all["date"].dt.date.max() if len(df_all) else None
     status = _build_status(
@@ -179,17 +257,52 @@ def refresh_live_job(
         dmax=dmax,
         cutoff=cutoff,
     )
+    status["latest_data_date"] = status["range"][1]
+    status["active_model_id"] = active_model_id
+    status["backend_mode"] = backend_mode
+    status["writer"] = "refresh_live_job"
+
+    if storage is not None:
+        written = _write_storage_runtime_artifacts(
+            storage=storage,
+            station_code=station_code,
+            df=df_all,
+            status=status,
+        )
+        return {
+            "ok": True,
+            "dry_run": False,
+            "station_code": station_code,
+            "rows": int(len(df_all)),
+            "range": status["range"],
+            "latest_data_date": status["latest_data_date"],
+            "active_model_id": active_model_id,
+            "backend_mode": backend_mode,
+            "written": written,
+            "warnings": [],
+            "status": status,
+        }
+
+    out_backfill = out / BACKFILL_FILENAME
+    df_all.to_parquet(out_backfill, index=False)
+
     status_path = out / STATUS_FILENAME
     status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("[backfill] rows=", len(df_all), "range=", dmin, "->", dmax, "out=", out_backfill)
     return {
+        "ok": True,
         "dry_run": False,
         "station_code": station_code,
         "rows": int(len(df_all)),
         "range": status["range"],
         "out_backfill": str(out_backfill),
         "status_path": str(status_path),
+        "latest_data_date": status["latest_data_date"],
+        "active_model_id": active_model_id,
+        "backend_mode": backend_mode,
+        "written": [str(out_backfill), str(status_path)],
+        "warnings": [],
         "status": status,
     }
 
