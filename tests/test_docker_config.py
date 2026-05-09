@@ -77,6 +77,22 @@ def test_docker_docs_include_local_build_run_and_endpoint_checks():
     assert "http://127.0.0.1:8000/health/live" in text
     assert "http://127.0.0.1:8000/status" in text
     assert "http://127.0.0.1:8000/docs" in text
+    assert "python scripts/check_container_api.py --expected-model-id seasonal_fno_v1" in text
+    assert "docker stop <container_id>" in text
+
+
+def test_container_api_check_script_is_lightweight():
+    script = Path("scripts/check_container_api.py")
+
+    assert script.exists()
+    text = script.read_text(encoding="utf-8")
+
+    assert "urllib.request" in text
+    assert "docker" not in text.lower().replace("start docker", "")
+    assert "requests" not in text
+    assert "/health/live" in text
+    assert "/status" in text
+    assert "/forecast" in text
 
 
 def test_artifact_backend_env_is_reflected_in_status():
