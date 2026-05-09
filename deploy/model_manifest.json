@@ -1,0 +1,14 @@
+{
+  "active_model_id": "seasonal_fno_v1",
+  "models": {
+    "seasonal_fno_v1": {
+      "model_id": "seasonal_fno_v1",
+      "station": "014501",
+      "horizon": 7,
+      "description": "Seasonal FNO baseline model for Stung Treng 7-day water-level forecasting",
+      "weights_key": "models/seasonal_fno_v1/weights/model.weights.h5",
+      "assets_version": "default",
+      "created_at": null
+    }
+  }
+}
