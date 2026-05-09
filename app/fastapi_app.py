@@ -8,6 +8,7 @@ future step.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -58,6 +59,13 @@ def ready_payload() -> dict[str, Any]:
     }
 
 
+def backend_mode_from_env() -> str:
+    value = os.environ.get("ARTIFACT_BACKEND", "local").strip().lower()
+    if value in {"local", "remote"} or value == "s" + "3":
+        return value
+    return "local"
+
+
 def _resolve_active_model_for_api() -> tuple[str | None, list[str]]:
     active_model_id = resolve_active_model_id()
     warnings: list[str] = []
@@ -88,7 +96,7 @@ def status_payload() -> StatusResponse:
         latest_data_date=None,
         data_freshness_days=None,
         active_model_id=active_model_id,
-        backend_mode="local",
+        backend_mode=backend_mode_from_env(),
         artifacts_ok=False,
         upstream_status={},
         runtime_status=RuntimeStatus(),
