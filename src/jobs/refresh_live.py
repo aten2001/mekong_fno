@@ -17,6 +17,31 @@ LATEST_INPUTS_FILENAME = "latest_inputs.json"
 LIVE_CACHE_FILENAME = "live_cache.json"
 
 
+def _env_flag(config, name: str, *, default: bool = False) -> bool:
+    raw = str(config.get(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _backend_mode(config) -> str:
+    value = str(config.get("ARTIFACT_BACKEND", "local")).strip().lower()
+    if value == "s" + "3":
+        return value
+    return "local"
+
+
+def _s3_storage_from_env(config):
+    from src.storage import S3StorageBackend
+
+    bucket = str(config.get("S3_BUCKET", "")).strip()
+    if not bucket:
+        raise RuntimeError("S3_BUCKET is required when ARTIFACT_BACKEND=s3")
+    prefix = str(config.get("S3_PREFIX", "")).strip()
+    region = str(config.get("AWS_REGION", "")).strip() or None
+    return S3StorageBackend(bucket=bucket, prefix=prefix, region_name=region)
+
+
 def _artifact_label(ref) -> str:
     return getattr(ref, "uri", str(ref))
 
@@ -212,6 +237,7 @@ def refresh_live_job(
         return {
             "ok": True,
             "dry_run": True,
+            "station": station_code,
             "station_code": station_code,
             "out_dir": str(out),
             "cache_path": str(cache),
@@ -272,6 +298,7 @@ def refresh_live_job(
         return {
             "ok": True,
             "dry_run": False,
+            "station": station_code,
             "station_code": station_code,
             "rows": int(len(df_all)),
             "range": status["range"],
@@ -293,6 +320,7 @@ def refresh_live_job(
     return {
         "ok": True,
         "dry_run": False,
+        "station": station_code,
         "station_code": station_code,
         "rows": int(len(df_all)),
         "range": status["range"],
@@ -308,21 +336,53 @@ def refresh_live_job(
 
 
 def main() -> None:
-    out_dir = Path(os.environ.get("OUT_DIR", "out"))
-    repo_id = os.environ.get("HF_DATASET_REPO", "").strip()
-    token = os.environ.get("HF_TOKEN", "").strip()
-    station_code = os.environ.get("STATION_CODE", "014501").strip() or "014501"
+    result = refresh_live_from_env()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
-    print("[env] HF_DATASET_REPO =", repo_id)
-    print("[env] STATION_CODE   =", station_code)
 
-    refresh_live_job(
+def refresh_live_from_env(
+    *,
+    env=None,
+    storage=None,
+    live_daily=None,
+) -> dict[str, Any]:
+    config = os.environ if env is None else env
+    out_dir = Path(config.get("OUT_DIR", "out"))
+    repo_id = str(config.get("HF_DATASET_REPO", "")).strip()
+    token = str(config.get("HF_TOKEN", "")).strip()
+    station_code = str(config.get("STATION_CODE", "014501")).strip() or "014501"
+    backend_mode = _backend_mode(config)
+    active_model_id = str(config.get("ACTIVE_MODEL_ID", "")).strip() or None
+    hf_publish = _env_flag(config, "HF_PUBLISH") or _env_flag(config, "HF_DATASET_PUBLISH")
+    dry_run = _env_flag(config, "DRY_RUN")
+
+    if backend_mode == "s" + "3" and storage is None and not dry_run:
+        storage = _s3_storage_from_env(config)
+
+    startup = {
+        "artifact_backend": backend_mode,
+        "station_code": station_code,
+        "active_model_id": active_model_id,
+        "hf_publish": hf_publish,
+        "dry_run": dry_run,
+        "hf_dataset_repo_configured": bool(repo_id),
+        "s3_bucket_configured": bool(str(config.get("S3_BUCKET", "")).strip()),
+        "s3_prefix": str(config.get("S3_PREFIX", "")).strip() or None,
+    }
+    print("[refresh_live][config]", json.dumps(startup, ensure_ascii=False, sort_keys=True))
+
+    return refresh_live_job(
         out_dir=out_dir,
         repo_id=repo_id,
         token=token,
         station_code=station_code,
         ttl_seconds=0,
-        download_existing=True,
+        download_existing=hf_publish,
+        live_daily=live_daily,
+        storage=storage,
+        active_model_id=active_model_id,
+        backend_mode=backend_mode,
+        dry_run=dry_run,
     )
 
 

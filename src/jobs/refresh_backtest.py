@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,6 +14,20 @@ from src.core.backtest import backtest_ytd_1day
 
 
 SUMMARY_FILENAME = "summary.json"
+
+
+def _env_flag(config, name: str, *, default: bool = False) -> bool:
+    raw = str(config.get(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _backend_mode(config) -> str:
+    value = str(config.get("ARTIFACT_BACKEND", "local")).strip().lower()
+    if value == "s" + "3":
+        return value
+    return "local"
 
 
 def _horizons(values: Iterable[int]) -> list[int]:
@@ -114,7 +129,9 @@ def refresh_backtest_job(
             "active_model_id": active_model_id,
             "backend_mode": backend_mode,
             "written": [],
-            "warnings": [],
+            "warnings": [
+                "Dry run only. Non-dry-run backtest currently requires an initialized runner and water_daily series.",
+            ],
         }
 
     if summary is not None:
@@ -216,8 +233,44 @@ def refresh_backtest_job(
 
 
 def main() -> None:
-    result = refresh_backtest_job(dry_run=True)
+    result = refresh_backtest_from_env()
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def refresh_backtest_from_env(
+    *,
+    env=None,
+) -> dict[str, Any]:
+    config = os.environ if env is None else env
+    backend_mode = _backend_mode(config)
+    active_model_id = str(config.get("ACTIVE_MODEL_ID", "")).strip() or None
+    station = str(config.get("STATION_CODE", "014501")).strip() or "014501"
+    model_id = str(config.get("MODEL_ID", "")).strip() or active_model_id
+    year = int(str(config.get("BACKTEST_YEAR", "2025")).strip() or "2025")
+    dry_run = _env_flag(config, "DRY_RUN", default=True)
+    horizons_raw = str(config.get("BACKTEST_HORIZONS", "1")).strip() or "1"
+    horizons = [int(part.strip()) for part in horizons_raw.split(",") if part.strip()]
+
+    startup = {
+        "artifact_backend": backend_mode,
+        "station": station,
+        "model_id": model_id,
+        "active_model_id": active_model_id,
+        "dry_run": dry_run,
+        "s3_bucket_configured": bool(str(config.get("S3_BUCKET", "")).strip()),
+        "s3_prefix": str(config.get("S3_PREFIX", "")).strip() or None,
+    }
+    print("[refresh_backtest][config]", json.dumps(startup, ensure_ascii=False, sort_keys=True))
+
+    return refresh_backtest_job(
+        year=year,
+        horizons=horizons,
+        station=station,
+        model_id=model_id,
+        active_model_id=active_model_id,
+        backend_mode=backend_mode,
+        dry_run=dry_run,
+    )
 
 
 if __name__ == "__main__":
