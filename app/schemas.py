@@ -63,6 +63,7 @@ class UpstreamStationStatus(BaseModel):
 class RuntimeStatus(BaseModel):
     cache_available: bool = False
     status_artifact_available: bool = False
+    latest_inputs_available: bool = False
     backtest_available: bool = False
 
 

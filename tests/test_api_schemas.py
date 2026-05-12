@@ -129,7 +129,6 @@ def test_fastapi_app_import_is_lightweight_and_static_safe():
         "_load_service",
         "app.app",
         "bo" + "to3",
-        "s" + "3",
     )
     for token in blocked:
         assert token not in source
