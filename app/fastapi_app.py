@@ -19,6 +19,7 @@ from app.schemas import (
     RuntimeStatus,
     StatusResponse,
 )
+from src.config import ConfigError, load_settings
 from src.model_manifest import (
     default_model_manifest_path,
     get_active_model_record,
@@ -64,10 +65,10 @@ def ready_payload() -> dict[str, Any]:
 
 
 def backend_mode_from_env(env=None) -> str:
-    config = os.environ if env is None else env
-    value = _env_value(config, "ARTIFACT_BACKEND", "local").lower()
-    if value in {"local", "remote"} or value == "s" + "3":
-        return value
+    try:
+        return load_settings(env=os.environ if env is None else env, validate=False).artifact_backend
+    except ConfigError:
+        pass
     return "local"
 
 
@@ -142,16 +143,19 @@ def _placeholder_status_payload(
 def _s3_storage_from_env(config):
     from src.storage import S3StorageBackend
 
-    bucket = _env_value(config, "S3_BUCKET")
-    if not bucket:
-        raise RuntimeError("S3_BUCKET is required when ARTIFACT_BACKEND=s3")
-    prefix = _env_value(config, "S3_PREFIX")
-    region = _env_value(config, "AWS_REGION") or None
-    return S3StorageBackend(bucket=bucket, prefix=prefix, region_name=region)
+    settings = load_settings(env=config, validate=True)
+    return S3StorageBackend(
+        bucket=settings.s3_bucket,
+        prefix=settings.s3_prefix,
+        region_name=settings.aws_region or None,
+    )
 
 
 def _s3_manifest_active_model_id(storage, config, warnings: list[str]) -> str | None:
-    manifest_key = _env_value(config, "MODEL_MANIFEST_KEY")
+    try:
+        manifest_key = load_settings(env=config, validate=False).model_manifest_key
+    except ConfigError:
+        manifest_key = _env_value(config, "MODEL_MANIFEST_KEY")
     if not manifest_key:
         return None
     try:
@@ -174,7 +178,10 @@ def _s3_runtime_status_payload(*, storage=None, env=None) -> StatusResponse:
         include_missing_warning=False,
     )
     warnings = [READ_ONLY_STATE_WARNING, *model_warnings]
-    station = _env_value(config, "TARGET_STATION") or _env_value(config, "STATION_CODE", "014501") or "014501"
+    try:
+        station = load_settings(env=config, validate=False).target_station
+    except ConfigError:
+        station = _env_value(config, "TARGET_STATION") or _env_value(config, "STATION_CODE", "014501") or "014501"
 
     try:
         runtime_storage = storage if storage is not None else _s3_storage_from_env(config)
