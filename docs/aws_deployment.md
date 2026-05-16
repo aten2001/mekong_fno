@@ -11,9 +11,48 @@ These notes document the validated AWS backend shape for the Mekong FNO v2 servi
 - If the backend is not needed for several days, the ALB can be deleted to reduce cost.
 - Keep S3, ECR, IAM roles, the ECS cluster, task definitions, security groups, target group, and the CloudWatch log group with 7-day retention.
 
+## Deployment Path Decision
+
+App Runner was an earlier considered option for hosting the FastAPI backend. It has been replaced by a Standard ECS/Fargate API service with an Application Load Balancer as the current AWS deployment path.
+
+ECS/Fargate is used because it provides:
+
+- Clear separation between the API task role and task execution role.
+- Read-only S3 access for the online API task role.
+- ALB target group health checks for the running API task.
+- Direct control over Fargate task definitions, container port mapping, CPU/memory, and environment variables.
+- Cold-standby cost control by setting Desired tasks = 0 when the AWS backend is not being demonstrated.
+- A natural path for future ECS/Fargate scheduled jobs that write shared runtime and backtest artifacts.
+
+Current request/data flow:
+
+```text
+HF Space -> ALB -> ECS/Fargate FastAPI -> S3
+ECS scheduled jobs -> S3
+ECR -> ECS/Fargate
+ECS/Fargate API and jobs -> CloudWatch Logs
+```
+
 ## Region
 
 - AWS Region: `ap-southeast-1`
+
+## Current AWS Resources
+
+| Resource | Current value |
+| --- | --- |
+| ECS Cluster | `mekong-fno-api-prod-cluster` |
+| ECS Service | `mekong-fno-api-prod` |
+| ECS Task Definition | `mekong-fno-api-prod` |
+| Container | `main` |
+| Container Port | `8000` |
+| ECR Repository | `mekong-fno-api` |
+| ECR Image Tag | `v0.1.1` |
+| ALB | `mekong-fno-api-alb` |
+| Target Group | `mekong-fno-api-tg` |
+| API Task Role | `mekong-fno-api-task-role` |
+| Task Execution Role | `ecsTaskExecutionRole` |
+| CloudWatch Log Group | `/aws/ecs/mekong-fno-api-prod` |
 
 ## Configuration
 
@@ -89,7 +128,7 @@ docker push <account-id>.dkr.ecr.ap-southeast-1.amazonaws.com/mekong-fno-api:v0.
 - Task execution role: `ecsTaskExecutionRole`
 - Desired tasks: `0` for cold-standby, `1` for validation/demo
 
-The current implementation uses standard ECS/Fargate, not App Runner, as the primary AWS backend path.
+The current implementation uses Standard ECS/Fargate, not App Runner, as the primary AWS backend path.
 
 ## ALB
 
@@ -163,4 +202,6 @@ The current ECS task may still use direct environment variables. Parameter Store
 
 ## App Runner
 
-App Runner was considered earlier as a simpler API hosting option, but it is not the current main deployment path. The current backend uses standard ECS/Fargate, ALB, S3, ECR, IAM task roles, and CloudWatch.
+App Runner was considered earlier as a simpler API hosting option. It has been replaced by Standard ECS/Fargate API Service with Application Load Balancer.
+
+App Runner is therefore historical context only. It is not the active or main FastAPI deployment path. The current backend uses Standard ECS/Fargate, ALB, S3, ECR, IAM task roles, and CloudWatch.
