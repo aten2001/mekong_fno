@@ -339,6 +339,18 @@ Persistent storage is important because the app distinguishes between static ass
 
 ---
 
+## Production-Oriented AWS Backend
+
+The long-running public demo remains the Hugging Face Space. In addition, the project now includes a validated ECS/Fargate + ALB deployment path for a production-oriented AWS backend used for validation and demonstrations.
+
+The AWS backend is not operated as a continuously running public service by default; it is kept in cold-standby mode and started on demand for validation or demonstrations. For cost control, the ECS API service normally uses Desired tasks = 0 when not demonstrating, and Desired tasks = 1 only for validation/interview/demo sessions.
+
+The AWS backend uses ECS/Fargate, ECR, S3 runtime artifacts, IAM task roles, CloudWatch logs, and ECS/Fargate scheduled jobs. The online FastAPI API is read-only against shared runtime state, while scheduled jobs are the single writer for refreshed runtime/backtest artifacts. S3 stores runtime artifacts and model manifests.
+
+See [AWS deployment notes](docs/aws_deployment.md) and [AWS cost control](docs/cost_control.md) for details.
+
+---
+
 ## 11. Modeling Approach
 
 ### 11.1 Final Production Approach
