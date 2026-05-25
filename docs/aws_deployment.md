@@ -26,14 +26,16 @@ ECS/Fargate is used because it provides:
 - Cold-standby cost control by setting Desired tasks = 0 when the AWS backend is not being demonstrated.
 - Existing ECS/Fargate scheduled job entrypoints that write shared runtime and backtest artifacts.
 
-Current request/data flow:
+Current validated AWS backend path:
 
 ```text
-HF Space -> ALB -> ECS/Fargate FastAPI -> S3
-ECS scheduled jobs -> S3
-ECR -> ECS/Fargate
-ECS/Fargate API and jobs -> CloudWatch Logs
+Hugging Face Space optional remote mode -> ALB -> ECS/Fargate FastAPI -> S3 runtime artifacts
+ECS/Fargate scheduled jobs -> S3 runtime artifacts and model manifests
+ECR image v0.1.1 -> ECS/Fargate API task
+ECS/Fargate API and scheduled jobs -> CloudWatch Logs
 ```
+
+The online FastAPI backend is read-only. Scheduled jobs are the single writer to S3 runtime artifacts, and S3 stores runtime artifacts and model manifests.
 
 ## Region
 
@@ -43,18 +45,20 @@ ECS/Fargate API and jobs -> CloudWatch Logs
 
 | Resource | Current value |
 | --- | --- |
-| ECS Cluster | `mekong-fno-api-prod-cluster` |
-| ECS Service | `mekong-fno-api-prod` |
-| ECS Task Definition | `mekong-fno-api-prod` |
-| Container | `main` |
-| Container Port | `8000` |
+| API ECS Cluster | `mekong-fno-api-prod-cluster` |
+| API ECS Service | `mekong-fno-api-prod` |
+| API Task Definition | `mekong-fno-api-prod` |
+| API Container | `main` |
+| API Container Port | `8000` |
 | ECR Repository | `mekong-fno-api` |
 | ECR Image Tag | `v0.1.1` |
-| ALB | `mekong-fno-api-alb` |
+| Validated ALB Path | `mekong-fno-api-alb` -> `mekong-fno-api-tg` -> ECS/Fargate API task |
 | Target Group | `mekong-fno-api-tg` |
+| Target Type | `IP` |
+| Target Port | `8000` |
+| Health Check Path | `/health/live` |
 | API Task Role | `mekong-fno-api-task-role` |
 | Task Execution Role | `ecsTaskExecutionRole` |
-| CloudWatch Log Group | `/aws/ecs/mekong-fno-api-prod` |
 | Jobs ECS Cluster | `mekong-fno-jobs-prod` |
 | refresh_live Task Definition | `mekong-fno-refresh-live` |
 | refresh_backtest Task Definition | `mekong-fno-refresh-backtest` |
@@ -62,8 +66,10 @@ ECS/Fargate API and jobs -> CloudWatch Logs
 | Jobs Security Group | `mekong-fno-jobs-sg` |
 | EventBridge Live Schedule | `mekong-fno-refresh-live-daily` (Disabled by default) |
 | EventBridge Backtest Schedule | `mekong-fno-refresh-backtest-weekly` (Disabled by default) |
+| API CloudWatch Log Group | `/aws/ecs/mekong-fno-api-prod` |
 | refresh_live Log Group | `/aws/ecs/mekong-fno-refresh-live` |
 | refresh_backtest Log Group | `/aws/ecs/mekong-fno-refresh-backtest` |
+| CloudWatch Log Retention | 7 days |
 
 ## Cold-Standby Operating Model
 
@@ -74,14 +80,14 @@ Default low-cost state:
 - ECS API service Desired tasks = 0.
 - EventBridge Scheduler entries are Disabled.
 - CloudWatch log retention = 7 days.
-- S3, ECR, IAM roles, ECS task definitions, ECS clusters, security groups, target groups, and CloudWatch log groups are retained as deployment assets.
+- S3, ECR, IAM roles, ECS task definitions, ECS clusters, and CloudWatch log groups are retained as deployment assets.
 - The ALB can be deleted when it is not needed for demonstrations.
 
 Demo/validation state:
 
 - ECS API service Desired tasks = 1.
-- ALB is created or retained.
-- Target group health is checked.
+- ALB exists or is recreated.
+- Target group becomes healthy.
 - `/health/live`, `/status`, and `/docs` are verified.
 
 ## Configuration
@@ -250,4 +256,4 @@ The current ECS task may still use direct environment variables. Parameter Store
 
 App Runner was considered earlier as a simpler API hosting option. It has been replaced by Standard ECS/Fargate API Service with Application Load Balancer.
 
-App Runner is therefore historical context only. It is not the active or main FastAPI deployment path. The current backend uses Standard ECS/Fargate, ALB, S3, ECR, IAM task roles, and CloudWatch.
+App Runner is therefore historical context only. It is not the current main deployment path and is not the active FastAPI deployment path. The current backend uses Standard ECS/Fargate, ALB, S3, ECR, IAM task roles, and CloudWatch.

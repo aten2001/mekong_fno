@@ -23,7 +23,10 @@ Demo/validation state:
 - ECS API service Desired tasks = 1
 - ALB exists or is recreated
 - Target group becomes healthy
-- API endpoints checked: `/health/live`, `/status`, and `/docs`
+- API endpoints are checked:
+  - `/health/live`
+  - `/status`
+  - `/docs`
 
 ## Cost Boundaries
 
@@ -45,7 +48,7 @@ Demo/validation state:
 - No NAT Gateway
 - No unattached Elastic IP
 - CloudWatch retention = 7 days
-- ALB removed if not needed for demonstrations
+- ALB removed if no near-term demonstration is needed
 - S3 / ECR / IAM / ECS task definitions retained
 
 ## When Demonstrating
@@ -56,6 +59,7 @@ Demo/validation state:
 - Verify `/health/live`, `/status`, and `/docs`
 - Optionally run `refresh_live` or `refresh_backtest` manually
 - Return Desired tasks to 0 after demonstration
+- Disable schedules again if temporarily enabled
 
 ## What Not To Do Yet
 

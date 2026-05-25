@@ -423,6 +423,39 @@ Without this distinction, refreshed artifacts, cached outputs, and evaluation st
 
 ---
 
+## 9.4 Production-Oriented AWS Backend
+
+The Hugging Face Space is the public demo layer. AWS is used as a validated production-oriented backend for cold-standby validation, screenshots, interviews, and demonstrations.
+
+```mermaid
+flowchart LR
+    HF[Hugging Face Space<br/>Public demo] -->|optional remote mode| ALB[Application Load Balancer<br/>validated path]
+
+    ALB --> API[ECS/Fargate FastAPI<br/>read-only API]
+    API -->|read-only| S3[(S3 runtime artifacts<br/>model manifests)]
+
+    ECR[ECR<br/>Docker image v0.1.1] --> API
+
+    EB[EventBridge Scheduler<br/>Disabled by default] --> JOBS[ECS/Fargate scheduled jobs<br/>refresh_live / refresh_backtest]
+    JOBS -->|single writer| S3
+
+    CW[CloudWatch Logs<br/>7-day retention] <-. logs .-> API
+    CW <-. logs .-> JOBS
+```
+
+In this AWS path:
+
+* Hugging Face Space remains the long-running public demo layer.
+* AWS provides a validated production-oriented backend, not an always-on public service by default.
+* The ECS/Fargate FastAPI service is read-only against shared runtime state.
+* ECS/Fargate scheduled jobs are the single writer to runtime and backtest artifacts.
+* S3 is the artifact boundary for runtime artifacts and model manifests.
+* ECR stores deployable container images such as `v0.1.1`.
+* CloudWatch separates API logs from scheduled job logs, with 7-day retention.
+* EventBridge Scheduler is Disabled by default to avoid unintended recurring cost.
+
+---
+
 ## 10. Automation Architecture
 
 ## 10.1 Scheduled Backfill Publication

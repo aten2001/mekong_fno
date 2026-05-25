@@ -341,13 +341,13 @@ Persistent storage is important because the app distinguishes between static ass
 
 ## Production-Oriented AWS Backend
 
-The long-running public demo remains the Hugging Face Space. In addition, the project now includes a validated ECS/Fargate + ALB deployment path for a production-oriented AWS backend used for validation and demonstrations.
+The long-running public demo remains the Hugging Face Space. AWS is used as a production-oriented cold-standby backend for validation, screenshots, interviews, and demonstrations through a validated ECS/Fargate + ALB deployment path.
 
-The AWS backend is not operated as a continuously running public service by default; it is kept in cold-standby mode and started on demand for validation or demonstrations. For cost control, the ECS API service normally uses Desired tasks = 0 when not demonstrating, and Desired tasks = 1 only for validation/interview/demo sessions.
+The AWS backend is not operated as a continuously running public service by default; it is kept in cold-standby mode and started on demand for validation or demonstrations. For cost control, the ECS API service normally uses Desired tasks = 0 when not demonstrating.
 
-The AWS backend uses ECS/Fargate, ECR, S3 runtime artifacts, IAM task roles, CloudWatch logs, and ECS/Fargate scheduled jobs. The online FastAPI API is read-only against shared runtime state, while scheduled jobs are the single writer for refreshed runtime/backtest artifacts. S3 stores runtime artifacts and model manifests.
+The validated AWS path uses ECS/Fargate, ECR, S3 runtime artifacts, IAM task roles, CloudWatch logs, EventBridge Scheduler, and ECS/Fargate scheduled jobs. The online FastAPI API is read-only against shared runtime state, while scheduled jobs are the single writer for refreshed runtime/backtest artifacts. S3 stores runtime artifacts and model manifests.
 
-See [AWS deployment notes](docs/aws_deployment.md) and [AWS cost control](docs/cost_control.md) for details.
+See [AWS deployment notes](docs/aws_deployment.md), [architecture](docs/architecture.md), [AWS cost control](docs/cost_control.md), and [rollback notes](docs/rollback.md) for details.
 
 ---
 
