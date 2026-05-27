@@ -47,23 +47,23 @@ These layers are connected through a cached process-level service object that al
 
 ```mermaid
 flowchart TD
-    A[Historical station files in data/] --> D[Runtime service]
-    B[Recently updated API-fetched daily values] --> D
-    C[Static assets and model checkpoints] --> D
+    HIST["Historical station files: data"] --> RUNTIME["Runtime service"]
+    LIVE["Recently updated daily values"] --> RUNTIME
+    ASSETS["Static assets and model checkpoints"] --> RUNTIME
 
-    D --> E[Base FNO forecast]
-    D --> F[Persistence baseline]
-    D --> G[Upstream-assisted correction]
+    RUNTIME --> FNO["Base FNO forecast"]
+    RUNTIME --> PERSIST["Persistence baseline"]
+    RUNTIME --> ASSIST["Upstream-assisted correction"]
 
-    E --> H[Live forecast outputs]
-    F --> I[Evaluation / backtest outputs]
-    G --> I
-    E --> I
+    FNO --> LIVE_OUT["Live forecast outputs"]
+    PERSIST --> EVAL["Evaluation and backtest outputs"]
+    ASSIST --> EVAL
+    FNO --> EVAL
 
-    I --> J[Advanced diagnostics]
-    H --> K[Tab 1: Live forecast]
-    I --> L[Tab 2: Backtest / comparison]
-    J --> L
+    EVAL --> DIAG["Advanced diagnostics"]
+    LIVE_OUT --> TAB1["Tab 1: live forecast"]
+    EVAL --> TAB2["Tab 2: backtest and comparison"]
+    DIAG --> TAB2
 ```
 
 This diagram reflects the current deployed logic:
@@ -429,19 +429,19 @@ The Hugging Face Space is the public demo layer. AWS is used as a validated prod
 
 ```mermaid
 flowchart LR
-    USER[User / recruiter / client] --> HF[Hugging Face Space<br/>Public demo]
-    HF -->|optional remote mode| ALB[Application Load Balancer<br/>validated path]
+    USER["User / recruiter / client"] --> HF["Hugging Face Space: public demo"]
+    HF -- "optional remote mode" --> ALB["Application Load Balancer: validated deployment path"]
 
-    ALB --> API[ECS/Fargate FastAPI<br/>read-only API]
-    API -->|read-only| S3[(S3 runtime artifacts<br/>model manifests)]
+    ALB --> API["ECS/Fargate FastAPI: read-only API"]
+    API -- "read-only" --> S3["S3 runtime artifacts: model manifests, status, cache"]
 
-    ECR[ECR<br/>Docker image v0.1.1] --> API
+    ECR["ECR image: v0.1.1"] --> API
 
-    EB[EventBridge Scheduler<br/>Disabled by default] --> JOBS[ECS/Fargate scheduled jobs<br/>refresh_live / refresh_backtest]
-    JOBS -->|single writer| S3
+    EB["EventBridge Scheduler: disabled by default"] --> JOBS["ECS/Fargate scheduled jobs: refresh_live and refresh_backtest"]
+    JOBS -- "single writer" --> S3
 
-    CW[CloudWatch Logs<br/>7-day retention] <-. logs .-> API
-    CW <-. logs .-> JOBS
+    API -. "API logs" .-> CW["CloudWatch Logs: 7-day retention"]
+    JOBS -. "job logs" .-> CW
 ```
 
 In this AWS path:

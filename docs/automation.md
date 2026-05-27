@@ -122,13 +122,13 @@ The current automation is meaningful and useful, but intentionally lightweight.
 
 ```mermaid
 flowchart TD
-    A[Scheduled GitHub Actions workflow] --> B[Backfill / update logic]
-    B --> C[Generate or refresh artifacts]
-    C --> D[Publish updated artifacts]
-    D --> E[Repository / deployment-visible state]
-    E --> F[HF Space runtime access]
-    F --> G[Reloadable forecasting application]
-````
+    SCHEDULE["Scheduled GitHub Actions workflow"] --> UPDATE["Backfill and update logic"]
+    UPDATE --> GENERATE["Generate or refresh artifacts"]
+    GENERATE --> PUBLISH["Publish updated artifacts"]
+    PUBLISH --> STATE["Repository and deployment-visible state"]
+    STATE --> HF_RUNTIME["HF Space runtime access"]
+    HF_RUNTIME --> APP["Reloadable forecasting application"]
+```
 
 This flow captures the intended role of the current automation layer:
 
