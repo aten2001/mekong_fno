@@ -429,7 +429,8 @@ The Hugging Face Space is the public demo layer. AWS is used as a validated prod
 
 ```mermaid
 flowchart LR
-    HF[Hugging Face Space<br/>Public demo] -->|optional remote mode| ALB[Application Load Balancer<br/>validated path]
+    USER[User / recruiter / client] --> HF[Hugging Face Space<br/>Public demo]
+    HF -->|optional remote mode| ALB[Application Load Balancer<br/>validated path]
 
     ALB --> API[ECS/Fargate FastAPI<br/>read-only API]
     API -->|read-only| S3[(S3 runtime artifacts<br/>model manifests)]
