@@ -12,8 +12,10 @@ jobs:
       ARTIFACT_BACKEND: local
       PYTHONPATH: .
     steps:
-      - name: Check out repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,6 +29,18 @@ jobs:
 
       - name: Compile
         run: python -m compileall app src tests
+
+      - name: Verify checkpoint files
+        run: |
+          ls -lh weights
+          git lfs ls-files
+          test -f weights/checkpoint
+          test -f weights/stung_treng_fno.ckpt.index
+          test -f weights/stung_treng_fno.ckpt.data-00000-of-00001
+          if grep -q "git-lfs.github.com/spec" weights/stung_treng_fno.ckpt.data-00000-of-00001; then
+            echo "Checkpoint data file is still a Git LFS pointer, not real binary content."
+            exit 1
+          fi
 
       - name: Run tests
         run: python -m pytest tests -q -p no:cacheprovider
