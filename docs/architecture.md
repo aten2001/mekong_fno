@@ -47,23 +47,23 @@ These layers are connected through a cached process-level service object that al
 
 ```mermaid
 flowchart TD
-    A[Historical station files in data/] --> D[Runtime service]
-    B[Recently updated API-fetched daily values] --> D
-    C[Static assets and model checkpoints] --> D
+    HIST["Historical station files: data"] --> RUNTIME["Runtime service"]
+    LIVE["Recently updated daily values"] --> RUNTIME
+    ASSETS["Static assets and model checkpoints"] --> RUNTIME
 
-    D --> E[Base FNO forecast]
-    D --> F[Persistence baseline]
-    D --> G[Upstream-assisted correction]
+    RUNTIME --> FNO["Base FNO forecast"]
+    RUNTIME --> PERSIST["Persistence baseline"]
+    RUNTIME --> ASSIST["Upstream-assisted correction"]
 
-    E --> H[Live forecast outputs]
-    F --> I[Evaluation / backtest outputs]
-    G --> I
-    E --> I
+    FNO --> LIVE_OUT["Live forecast outputs"]
+    PERSIST --> EVAL["Evaluation and backtest outputs"]
+    ASSIST --> EVAL
+    FNO --> EVAL
 
-    I --> J[Advanced diagnostics]
-    H --> K[Tab 1: Live forecast]
-    I --> L[Tab 2: Backtest / comparison]
-    J --> L
+    EVAL --> DIAG["Advanced diagnostics"]
+    LIVE_OUT --> TAB1["Tab 1: live forecast"]
+    EVAL --> TAB2["Tab 2: backtest and comparison"]
+    DIAG --> TAB2
 ```
 
 This diagram reflects the current deployed logic:
@@ -420,6 +420,40 @@ Persistent storage is important because the application distinguishes between:
 * runtime-generated operational files
 
 Without this distinction, refreshed artifacts, cached outputs, and evaluation state would be harder to manage consistently in a deployed environment.
+
+---
+
+## 9.4 Production-Oriented AWS Backend
+
+The Hugging Face Space is the public demo layer. AWS is used as a validated production-oriented backend for cold-standby validation, screenshots, interviews, and demonstrations.
+
+```mermaid
+flowchart LR
+    USER["User / recruiter / client"] --> HF["Hugging Face Space: public demo"]
+    HF -- "optional remote mode" --> ALB["Application Load Balancer: validated deployment path"]
+
+    ALB --> API["ECS/Fargate FastAPI: read-only API"]
+    API -- "read-only" --> S3["S3 runtime artifacts: model manifests, status, cache"]
+
+    ECR["ECR image: v0.1.1"] --> API
+
+    EB["EventBridge Scheduler: disabled by default"] --> JOBS["ECS/Fargate scheduled jobs: refresh_live and refresh_backtest"]
+    JOBS -- "single writer" --> S3
+
+    API -. "API logs" .-> CW["CloudWatch Logs: 7-day retention"]
+    JOBS -. "job logs" .-> CW
+```
+
+In this AWS path:
+
+* Hugging Face Space remains the long-running public demo layer.
+* AWS provides a validated production-oriented backend, not an always-on public service by default.
+* The ECS/Fargate FastAPI service is read-only against shared runtime state.
+* ECS/Fargate scheduled jobs are the single writer to runtime and backtest artifacts.
+* S3 is the artifact boundary for runtime artifacts and model manifests.
+* ECR stores deployable container images such as `v0.1.1`.
+* CloudWatch separates API logs from scheduled job logs, with 7-day retention.
+* EventBridge Scheduler is Disabled by default to avoid unintended recurring cost.
 
 ---
 

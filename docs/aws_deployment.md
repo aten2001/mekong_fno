@@ -1,15 +1,17 @@
 # AWS Deployment Notes
 
-These notes document the validated AWS backend shape for the Mekong FNO v2 service. They are operational guidance only: this repository does not create AWS infrastructure in code, and the examples below do not include credentials or secrets.
+These notes document the validated AWS backend shape for the Mekong FNO v2 service. They are operational guidance only: this repository does not create AWS infrastructure in code, and the examples below use placeholders for sensitive values.
 
 ## Deployment Strategy
 
 - Hugging Face Space remains the long-running public demo.
 - AWS is the production-oriented cold-standby backend for validation, interviews, and demos.
+- The AWS backend is not operated as a continuously running public service by default; it is kept in cold-standby mode and started on demand for validation or demonstrations.
 - When not demonstrating, keep the ECS service at Desired tasks = 0.
 - When demonstrating, set Desired tasks = 1 and wait until the target group reports healthy.
 - If the backend is not needed for several days, the ALB can be deleted to reduce cost.
-- Keep S3, ECR, IAM roles, the ECS cluster, task definitions, security groups, target group, and the CloudWatch log group with 7-day retention.
+- Keep S3, ECR, IAM roles, ECS clusters, task definitions, security groups, target groups, and CloudWatch log groups with 7-day retention.
+- See [`cost_control.md`](cost_control.md) for the detailed low-cost operating model.
 
 ## Deployment Path Decision
 
@@ -22,16 +24,18 @@ ECS/Fargate is used because it provides:
 - ALB target group health checks for the running API task.
 - Direct control over Fargate task definitions, container port mapping, CPU/memory, and environment variables.
 - Cold-standby cost control by setting Desired tasks = 0 when the AWS backend is not being demonstrated.
-- A natural path for future ECS/Fargate scheduled jobs that write shared runtime and backtest artifacts.
+- Existing ECS/Fargate scheduled job entrypoints that write shared runtime and backtest artifacts.
 
-Current request/data flow:
+Current validated AWS backend path:
 
 ```text
-HF Space -> ALB -> ECS/Fargate FastAPI -> S3
-ECS scheduled jobs -> S3
-ECR -> ECS/Fargate
-ECS/Fargate API and jobs -> CloudWatch Logs
+Hugging Face Space optional remote mode -> ALB -> ECS/Fargate FastAPI -> S3 runtime artifacts
+ECS/Fargate scheduled jobs -> S3 runtime artifacts and model manifests
+ECR image v0.1.1 -> ECS/Fargate API task
+ECS/Fargate API and scheduled jobs -> CloudWatch Logs
 ```
+
+The online FastAPI backend is read-only. Scheduled jobs are the single writer to S3 runtime artifacts, and S3 stores runtime artifacts and model manifests.
 
 ## Region
 
@@ -41,18 +45,50 @@ ECS/Fargate API and jobs -> CloudWatch Logs
 
 | Resource | Current value |
 | --- | --- |
-| ECS Cluster | `mekong-fno-api-prod-cluster` |
-| ECS Service | `mekong-fno-api-prod` |
-| ECS Task Definition | `mekong-fno-api-prod` |
-| Container | `main` |
-| Container Port | `8000` |
+| API ECS Cluster | `mekong-fno-api-prod-cluster` |
+| API ECS Service | `mekong-fno-api-prod` |
+| API Task Definition | `mekong-fno-api-prod` |
+| API Container | `main` |
+| API Container Port | `8000` |
 | ECR Repository | `mekong-fno-api` |
 | ECR Image Tag | `v0.1.1` |
-| ALB | `mekong-fno-api-alb` |
+| Validated ALB Path | `mekong-fno-api-alb` -> `mekong-fno-api-tg` -> ECS/Fargate API task |
 | Target Group | `mekong-fno-api-tg` |
+| Target Type | `IP` |
+| Target Port | `8000` |
+| Health Check Path | `/health/live` |
 | API Task Role | `mekong-fno-api-task-role` |
 | Task Execution Role | `ecsTaskExecutionRole` |
-| CloudWatch Log Group | `/aws/ecs/mekong-fno-api-prod` |
+| Jobs ECS Cluster | `mekong-fno-jobs-prod` |
+| refresh_live Task Definition | `mekong-fno-refresh-live` |
+| refresh_backtest Task Definition | `mekong-fno-refresh-backtest` |
+| Jobs Task Role | `mekong-fno-jobs-task-role` |
+| Jobs Security Group | `mekong-fno-jobs-sg` |
+| EventBridge Live Schedule | `mekong-fno-refresh-live-daily` (Disabled by default) |
+| EventBridge Backtest Schedule | `mekong-fno-refresh-backtest-weekly` (Disabled by default) |
+| API CloudWatch Log Group | `/aws/ecs/mekong-fno-api-prod` |
+| refresh_live Log Group | `/aws/ecs/mekong-fno-refresh-live` |
+| refresh_backtest Log Group | `/aws/ecs/mekong-fno-refresh-backtest` |
+| CloudWatch Log Retention | 7 days |
+
+## Cold-Standby Operating Model
+
+The AWS backend is not operated as a continuously running public service by default; it is kept in cold-standby mode and started on demand for validation or demonstrations.
+
+Default low-cost state:
+
+- ECS API service Desired tasks = 0.
+- EventBridge Scheduler entries are Disabled.
+- CloudWatch log retention = 7 days.
+- S3, ECR, IAM roles, ECS task definitions, ECS clusters, and CloudWatch log groups are retained as deployment assets.
+- The ALB can be deleted when it is not needed for demonstrations.
+
+Demo/validation state:
+
+- ECS API service Desired tasks = 1.
+- ALB exists or is recreated.
+- Target group becomes healthy.
+- `/health/live`, `/status`, and `/docs` are verified.
 
 ## Configuration
 
@@ -130,6 +166,20 @@ docker push <account-id>.dkr.ecr.ap-southeast-1.amazonaws.com/mekong-fno-api:v0.
 
 The current implementation uses Standard ECS/Fargate, not App Runner, as the primary AWS backend path.
 
+## ECS/Fargate Scheduled Jobs
+
+The refresh jobs are ECS/Fargate one-off jobs, not long-running services.
+
+- Jobs cluster: `mekong-fno-jobs-prod`
+- `refresh_live` task definition: `mekong-fno-refresh-live`
+- `refresh_backtest` task definition: `mekong-fno-refresh-backtest`
+- Jobs task role: `mekong-fno-jobs-task-role`
+- Jobs security group: `mekong-fno-jobs-sg`
+- EventBridge schedule for live refresh: `mekong-fno-refresh-live-daily` (Disabled by default)
+- EventBridge schedule for backtest refresh: `mekong-fno-refresh-backtest-weekly` (Disabled by default)
+
+The scheduled jobs are the single writer for shared runtime/backtest artifacts. Keeping the schedules Disabled by default prevents automatic recurring job runs in the cold-standby operating mode.
+
 ## ALB
 
 - Name: `mekong-fno-api-alb`
@@ -181,7 +231,9 @@ arn:aws:s3:::<artifact-bucket>/mekong/v2/prod/*
 
 ## CloudWatch
 
-- Log group: `/aws/ecs/mekong-fno-api-prod`
+- API log group: `/aws/ecs/mekong-fno-api-prod`
+- refresh_live log group: `/aws/ecs/mekong-fno-refresh-live`
+- refresh_backtest log group: `/aws/ecs/mekong-fno-refresh-backtest`
 - Retention: 7 days
 
 ## Parameter Store
@@ -204,4 +256,4 @@ The current ECS task may still use direct environment variables. Parameter Store
 
 App Runner was considered earlier as a simpler API hosting option. It has been replaced by Standard ECS/Fargate API Service with Application Load Balancer.
 
-App Runner is therefore historical context only. It is not the active or main FastAPI deployment path. The current backend uses Standard ECS/Fargate, ALB, S3, ECR, IAM task roles, and CloudWatch.
+App Runner is therefore historical context only. It is not the current main deployment path and is not the active FastAPI deployment path. The current backend uses Standard ECS/Fargate, ALB, S3, ECR, IAM task roles, and CloudWatch.
