@@ -11,7 +11,7 @@ mekong/v2/prod/manifests/model_manifest.json
 The full expected S3 location is:
 
 ```text
-s3://mekong-fno-v2-artifacts-016042452555-ap-southeast-1-an/mekong/v2/prod/manifests/model_manifest.json
+s3://<artifact-bucket>/mekong/v2/prod/manifests/model_manifest.json
 ```
 
 This manifest only selects the active model and records the expected artifact keys. It does not mean the real model weights have already been uploaded.
