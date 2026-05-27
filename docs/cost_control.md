@@ -4,7 +4,7 @@
 
 This project uses AWS as a production-oriented validation/demo backend, while the Hugging Face Space remains the long-running public demo.
 
-The AWS backend exists to show that the system can run with production-style infrastructure: ECS/Fargate, ALB, ECR, S3 artifact storage, IAM role separation, CloudWatch logs, and ECS/Fargate scheduled jobs. It is not intended to run as a 24/7 public service by default.
+The AWS backend exists to show that the system can run with production-style infrastructure: ECS/Fargate, ALB, ECR, S3 artifact storage, IAM role separation, CloudWatch logs, and ECS/Fargate scheduled jobs. It is not intended to run continuously as a public service by default.
 
 ## Cold-Standby Model
 
@@ -63,7 +63,7 @@ Demo/validation state:
 
 ## What Not To Do Yet
 
-- Do not run ECS API 24/7 by default
+- Do not run the ECS API continuously by default
 - Do not enable EventBridge Scheduler permanently unless automatic daily/weekly refresh is required
 - Do not add NAT Gateway for this portfolio/demo mode
 - Do not add complex auto-deployment yet

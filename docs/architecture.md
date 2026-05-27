@@ -447,7 +447,7 @@ flowchart LR
 In this AWS path:
 
 * Hugging Face Space remains the long-running public demo layer.
-* AWS provides a validated production-oriented backend, not an always-on public service by default.
+* AWS provides a validated production-oriented backend, not a continuously running public service by default.
 * The ECS/Fargate FastAPI service is read-only against shared runtime state.
 * ECS/Fargate scheduled jobs are the single writer to runtime and backtest artifacts.
 * S3 is the artifact boundary for runtime artifacts and model manifests.

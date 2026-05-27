@@ -10,24 +10,50 @@ python_version: "3.10"
 pinned: false
 ---
 
-Mekong water level forecast (Stung Treng) with FNO.
+Applied ML forecasting and ML systems case study for Mekong water levels, with a live Hugging Face Space demo and a cold-standby AWS backend validation path.
 
-# Mekong FNO — Upstream-Assisted Water Level Forecasting System for Stung Treng
+# Mekong FNO: Production-Oriented Water-Level Forecasting System
 
-## A deployable station-level forecasting and evaluation system for Mekong water levels, combining an FNO-based data-driven core with hydrology-informed upstream correction, long-range backtesting, availability-aware diagnostics, and operational routing.
+Mekong FNO is an applied ML forecasting system for 7-day Stung Treng water-level prediction. The `mekong-v2` branch upgrades the original Hugging Face Space demo into a production-oriented AWS backend case study with a FastAPI service path, Dockerized runtime, ECS/Fargate validation deployment, S3 runtime artifacts, scheduled refresh jobs, GitHub Actions CI, and explicit cold-standby cost control.
+
+The long-running public demo remains the Hugging Face Space. The AWS backend is a cold-standby validation deployment for screenshots and demonstrations, not a continuously running public service.
 
 ## Quick Links
-- **Live Space:** [Open the live application](https://huggingface.co/spaces/mrcmekong/mekong_fno)
-- **Results Summary:** [Evaluation comparison report](assets/reports/eval_compare.json)
-- **Repository:** [GitHub](https://github.com/aten2001/mekong_fno)
-- **Automation / Update Pipeline:** [Scheduled backfill publishing workflow](https://github.com/aten2001/mekong_fno/blob/main/.github/workflows/publish_backfill.yml)
+- **Live Hugging Face Space:** [Open the public demo](https://huggingface.co/spaces/mrcmekong/mekong_fno)
+- **Architecture:** [docs/architecture.md](docs/architecture.md)
+- **AWS deployment notes:** [docs/aws_deployment.md](docs/aws_deployment.md)
+- **Cost control:** [docs/cost_control.md](docs/cost_control.md)
+- **Rollback notes:** [docs/rollback.md](docs/rollback.md)
+- **CI workflow:** [.github/workflows/ci.yml](.github/workflows/ci.yml)
+- **Backfill publishing workflow:** [.github/workflows/publish_backfill.yml](.github/workflows/publish_backfill.yml)
+- **Results summary artifact:** [assets/reports/eval_compare.json](assets/reports/eval_compare.json)
+
+## For Reviewers / Recruiters
+- Review the live forecasting UX in the [Hugging Face Space](https://huggingface.co/spaces/mrcmekong/mekong_fno).
+- Start with the system diagram in [docs/architecture.md](docs/architecture.md).
+- Inspect the validated ECS/Fargate + ALB deployment path in [docs/aws_deployment.md](docs/aws_deployment.md).
+- Check the cold-standby cost-control model in [docs/cost_control.md](docs/cost_control.md).
+- Review rollback planning in [docs/rollback.md](docs/rollback.md).
+- Verify that CI is test-only and handles Git LFS checkpoints in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+
+## Production-Oriented AWS Backend
+This branch demonstrates more than a model demo: it shows how the forecasting system can be shaped as an ML systems case study.
+
+- **Public demo:** Hugging Face Space remains the long-running public demo.
+- **Forecasting core:** FNO-based 7-day Stung Treng forecasting with upstream-assisted correction using 3S and Pakse.
+- **Validation:** Long-range backtesting, persistence baseline comparison, and availability-aware diagnostics.
+- **API path:** FastAPI service skeleton with read-only online behavior.
+- **Container path:** Docker image designed for ECR and ECS/Fargate.
+- **Artifact boundary:** S3 runtime artifacts and model manifests.
+- **Operations:** IAM task roles, CloudWatch logs, EventBridge scheduled jobs, and GitHub Actions CI with Git LFS checkpoint handling.
+- **Cost control:** ECS Desired tasks = 0 when not demonstrating; Desired tasks = 1 only for validation or demonstration.
 
 ## Project Snapshot
 - **Task:** Daily station-level water-level forecasting and evaluation for the Mekong River.
 - **Target station / region:** Stung Treng (014501), Mekong mainstem.
-- **Forecast horizon:** Next 7 days for live forecasting; 1–7 day ahead backtesting in the evaluation view.
+- **Forecast horizon:** Next 7 days for live forecasting; 1-7 day ahead backtesting in the evaluation view.
 - **Raw data sources:** Historical station series stored in the repository, combined at runtime with recently updated API-fetched daily values.
-- **Current system status:** Deployed on Hugging Face Spaces with persistent runtime storage, reload support, backtesting since 2025-01-01, persistence / assist comparison, and advanced availability-aware diagnostics in the UI.
+- **Current system status:** Live Hugging Face Space for public use, plus a production-oriented AWS backend case study for cold-standby validation.
 - **Core capabilities:** Live forecast, long-range backtesting, RMSE-focused evaluation summary, persistence baseline comparison, 3S/Pakse upstream-assisted correction, common-date fair comparison, source-availability summary, operational routing evaluation, uncertainty display, runtime cache/artifact management, and reloadable model/data service.
 
 ---
@@ -94,7 +120,10 @@ At runtime, these sources are merged into the daily series used for forecasting 
 ### 4.3 Application Architecture
 The application is structured around:
 - a Gradio UI layer in `app/app.py`
+- a Gradio entry wrapper in `app/gradio_app.py`
+- a FastAPI service skeleton in `app/fastapi_app.py`
 - modeling and inference utilities in `src/`
+- core, data, storage, and job boundaries under `src/`
 - runtime path, file, and locking logic in `app/runtime_*`
 - static inference/evaluation assets in `assets/`
 - model checkpoints in `weights/`
@@ -106,7 +135,7 @@ This separation keeps the UI, model logic, and operational runtime behavior dist
 The system distinguishes between static project assets and runtime-generated outputs. Caches, backfill artifacts, live-update outputs, and evaluation-related files are routed to a dedicated runtime root so that the app can support repeated forecasting, comparison, and refresh workflows in a stable operational layout.
 
 ### 4.5 Deployment Topology
-The project is designed to run both locally and on Hugging Face Spaces. In the hosted setup, runtime files are written to persistent storage so that refreshed artifacts and cached outputs can survive across app sessions. Locally, the same application can run with a project-local runtime directory.
+The project is designed to run locally, on Hugging Face Spaces, and through the validated ECS/Fargate + ALB deployment path. The Hugging Face Space remains the long-running public demo. The AWS backend is a production-oriented cold-standby validation path where the online FastAPI API is read-only, scheduled jobs are the single writer, and S3 stores runtime artifacts and model manifests.
 
 ### 4.6 Data / Model / UI Relationship
 The UI does not directly manage the forecasting logic. Instead, callbacks consume a cached service object that encapsulates the loaded model, merged daily series, upstream series, runtime state, and evaluation helpers. This lets the application behave as a station-level forecast service rather than a collection of disconnected scripts.
@@ -218,8 +247,8 @@ Read the repository from the operational entrypoint inward:
 
 This reading path makes it easier to verify that the system is organized as a deployable forecasting workflow rather than as a disconnected collection of experiments.
 
-### 7.4 Check the Automation / Refresh Workflow
-Review `.github/workflows/publish_backfill.yml` together with the app’s reload/runtime behavior. This is the key verification path for understanding how the project handles refreshed data, artifact publication, and repeatable operational updates.
+### 7.4 Check CI and Refresh Workflows
+Review `.github/workflows/ci.yml` for compile/test coverage and Git LFS checkpoint handling, then review `.github/workflows/publish_backfill.yml` together with the app's reload/runtime behavior. This is the key verification path for understanding how the project handles tests, refreshed data, artifact publication, and repeatable operational updates.
 
 ### 7.5 Reproduce the Main App Locally
 Run the same Gradio application locally to verify that the project works outside the hosted Space environment. This step is useful for confirming that the repository supports both hosted delivery and local reproducibility, which is an important part of its value as an applied AI / ML system.
@@ -230,20 +259,23 @@ Run the same Gradio application locally to verify that the project works outside
 
 ```text
 mekong_fno/
-├── .github/
-│   └── workflows/
-├── app/
-├── assets/
-├── data/
-├── docs/
-├── scripts/
-├── src/
-├── tests/
-├── weights/
-├── README.md
-├── requirements.txt
-├── requirements-actions.txt
-└── runtime.txt
+|-- .github/
+|   `-- workflows/
+|       |-- ci.yml
+|       `-- publish_backfill.yml
+|-- app/
+|-- assets/
+|-- data/
+|-- deploy/
+|-- docs/
+|-- scripts/
+|-- src/
+|-- tests/
+|-- weights/
+|-- Dockerfile
+|-- README.md
+|-- requirements.txt
+`-- runtime.txt
 ```
 
 ### 8.1 Main Application Files
@@ -323,7 +355,7 @@ The project is designed to run as a Hugging Face Space with a persistent runtime
 
 ### 10.2 GitHub Actions
 
-This repository uses a scheduled backfill publishing workflow in `.github/workflows/publish_backfill.yml` for automated update / artifact publication support.
+This repository uses `.github/workflows/ci.yml` for compile/test checks and Git LFS checkpoint handling. It also includes `.github/workflows/publish_backfill.yml` for automated update / artifact publication support.
 
 ### 10.3 Backfill / Cache / Artifact Flow
 
@@ -337,17 +369,9 @@ The UI exposes a reload control that refreshes the service state and makes newly
 
 Persistent storage is important because the app distinguishes between static assets and runtime-generated operational files.
 
----
+### 10.6 AWS Backend Operations
 
-## Production-Oriented AWS Backend
-
-The long-running public demo remains the Hugging Face Space. AWS is used as a production-oriented cold-standby backend for validation, screenshots, interviews, and demonstrations through a validated ECS/Fargate + ALB deployment path.
-
-The AWS backend is not operated as a continuously running public service by default; it is kept in cold-standby mode and started on demand for validation or demonstrations. For cost control, the ECS API service normally uses Desired tasks = 0 when not demonstrating.
-
-The validated AWS path uses ECS/Fargate, ECR, S3 runtime artifacts, IAM task roles, CloudWatch logs, EventBridge Scheduler, and ECS/Fargate scheduled jobs. The online FastAPI API is read-only against shared runtime state, while scheduled jobs are the single writer for refreshed runtime/backtest artifacts. S3 stores runtime artifacts and model manifests.
-
-See [AWS deployment notes](docs/aws_deployment.md), [architecture](docs/architecture.md), [AWS cost control](docs/cost_control.md), and [rollback notes](docs/rollback.md) for details.
+For the production-oriented AWS backend case study, see [docs/aws_deployment.md](docs/aws_deployment.md), [docs/cost_control.md](docs/cost_control.md), and [docs/rollback.md](docs/rollback.md). The backend is designed for cold-standby validation: ECS Desired tasks = 0 when not demonstrating.
 
 ---
 
@@ -444,12 +468,15 @@ This system does not attempt to present every experimental detail, every offline
 
 ## 14. Related Documents
 
-Recommended supporting documents to add and maintain over time:
+Recommended supporting documents:
 
-* `docs/results.md`
-* `docs/model-selection.md`
-* `docs/architecture.md`
-* `docs/deployment.md`
-* `docs/automation.md`
-* `docs/evaluation.md`
-* `docs/runtime-design.md`
+- [Architecture](docs/architecture.md)
+- [AWS deployment notes](docs/aws_deployment.md)
+- [AWS cost control](docs/cost_control.md)
+- [Rollback notes](docs/rollback.md)
+- [Results](docs/results.md)
+- [Model selection](docs/model-selection.md)
+- [Automation](docs/automation.md)
+- [Evaluation](docs/evaluation.md)
+- [Runtime design](docs/runtime-design.md)
+- [Docker notes](docs/docker.md)
