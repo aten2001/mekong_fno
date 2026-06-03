@@ -425,7 +425,7 @@ Without this distinction, refreshed artifacts, cached outputs, and evaluation st
 
 ## 9.4 Production-Oriented AWS Backend
 
-The Hugging Face Space is the public demo layer. AWS is used as a validated production-oriented backend for cold-standby validation, screenshots, interviews, and demonstrations.
+The Hugging Face Space is the public demo layer. AWS is used as a validated production-oriented backend for cold-standby validation, screenshots and demonstrations.
 
 ```mermaid
 flowchart LR

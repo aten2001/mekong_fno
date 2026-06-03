@@ -1,6 +1,6 @@
 # AWS Screenshot Guide
 
-This directory stores redacted AWS screenshots for portfolio and interview explanations.
+This directory stores redacted AWS screenshots for portfolio explanations.
 
 Screenshots are optional documentation artifacts. The architecture diagram is preferred for public sharing, and raw AWS console screenshots should be redacted before commit.
 
