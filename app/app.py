@@ -25,7 +25,7 @@ Key design constraints:
 import os, sys
 
 # Force TensorFlow to use legacy tf.keras (Keras 2) behavior on TF>=2.16
-os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+# os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 
