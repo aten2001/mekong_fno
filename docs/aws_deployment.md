@@ -5,7 +5,7 @@ These notes document the validated AWS backend shape for the Mekong FNO v2 servi
 ## Deployment Strategy
 
 - Hugging Face Space remains the long-running public demo.
-- AWS is the production-oriented cold-standby backend for validation, interviews, and demos.
+- AWS is the production-oriented cold-standby backend for validation and demos.
 - The AWS backend is not operated as a continuously running public service by default; it is kept in cold-standby mode and started on demand for validation or demonstrations.
 - When not demonstrating, keep the ECS service at Desired tasks = 0.
 - When demonstrating, set Desired tasks = 1 and wait until the target group reports healthy.
