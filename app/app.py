@@ -89,7 +89,12 @@ from src.data.historical import load_runner_history_daily
 from src.data.live import fetch_live_daily_series
 from src.data.merge import build_target_daily_series, merge_upstream_daily_series
 from src.data.upstream import load_upstream_daily_csv
-from src.data.validation import recent_missing_dates, stable_live_daily_until
+from src.data.validation import (
+    anchor_fallback_reason,
+    latest_finite_date,
+    recent_missing_dates,
+    stable_live_daily_until,
+)
 
 # Live daily means from MRC API (cached)
 from src.backfill import read_backfill, series_from_any
@@ -313,6 +318,25 @@ def _load_or_fit_assist_params(
 _APP_CACHE: dict = {}
 _APP_LOCK = threading.Lock()
 
+
+def _series_debug_stats(name: str, series: Optional[pd.Series]) -> dict:
+    if series is None or len(series) == 0:
+        stats = {"name": name, "rows": 0, "min": None, "max": None, "latest_finite": None}
+    else:
+        stats = {
+            "name": name,
+            "rows": int(len(series)),
+            "min": str(min(series.index)),
+            "max": str(max(series.index)),
+            "latest_finite": str(latest_finite_date(series)),
+        }
+    print(
+        f"[app][data] {name}: rows={stats['rows']}, "
+        f"range={stats['min']} -> {stats['max']}, latest_finite={stats['latest_finite']}"
+    )
+    return stats
+
+
 def _load_service(force_reload: bool = False):
     """
     Initialize and cache the end-to-end inference “service” (model, data, upstream series).
@@ -349,6 +373,7 @@ def _load_service(force_reload: bool = False):
 
         runner = TenYearUnifiedRunner(CSV_DIR, seq_length=SEQ_LENGTH, pred_length=PRED_LENGTH)
         water_daily_hist = load_runner_history_daily(runner, 2015, 2025, allow_missing_u=True)
+        _series_debug_stats("historical target", water_daily_hist)
 
         # Training-time artifacts: climatology + normalization stats
         runner.set_climatology(np.load(CLIM_PATH))
@@ -369,6 +394,7 @@ def _load_service(force_reload: bool = False):
         # ---------------------------------------------------------------------
         # read historical backfill (Parquet)
         backfill = read_backfill(BACKFILL_PATH)
+        _series_debug_stats("live_backfill", backfill)
 
         # fetch live daily means
         live_daily = fetch_live_daily_series(
@@ -377,8 +403,10 @@ def _load_service(force_reload: bool = False):
             ttl_seconds=900,
             error_label="[app] live fetch skipped",
         )
+        _series_debug_stats("API recent target", live_daily)
 
         water_daily = build_target_daily_series(water_daily_hist, backfill, live_daily)
+        _series_debug_stats("merged target", water_daily)
 
         # ---------------------------------------------------------------------------------------
         # Persist “stable” part of live data into backfill (<= today-1).
@@ -1050,6 +1078,27 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
     except Exception as e:
         return None, f"Not enough contiguous data: {e}", None
 
+    anchor_diag = anchor_fallback_reason(
+        water_daily,
+        selected_anchor=anchor,
+        need=SEQ_LENGTH,
+        stale_threshold_days=3,
+    )
+    latest_missing = anchor_diag["latest_window_missing_dates"]
+    print(
+        "[app][forecast-anchor] "
+        f"merged_latest_finite={anchor_diag['latest_finite_date']}, "
+        f"selected_anchor={anchor_diag['selected_anchor']}, "
+        f"stale_days={anchor_diag['stale_days']}, "
+        f"latest_window_missing_count={anchor_diag['latest_window_missing_count']}"
+    )
+    if latest_missing:
+        preview = ", ".join(str(d) for d in latest_missing[:8])
+        suffix = "..." if len(latest_missing) > 8 else ""
+        print(f"[app][forecast-anchor][missing] {preview}{suffix}")
+    if anchor_diag["is_stale"]:
+        print(f"[app][forecast-anchor][warn] {anchor_diag['reason']}")
+
     # Build model input window.
     try:
         Xn, fut_dates = _build_window_Xn(runner, water_daily, pd.Timestamp(anchor))
@@ -1193,6 +1242,14 @@ def ui_predict_today(show_uncertainty=False, src_choice="Historical residuals (f
             pass
 
     note = "Next 7-day absolute water level (UTC+07)"
+    if anchor_diag["is_stale"]:
+        note = (
+            f"WARNING: Latest usable forecast anchor is {anchor_diag['selected_anchor']} "
+            f"because {anchor_diag['reason']}. The plot below is not a current-date forecast. "
+            f"Latest merged finite date is {anchor_diag['latest_finite_date']}. "
+            f"Missing values in latest candidate input window: "
+            f"{anchor_diag['latest_window_missing_count']}. "
+        ) + note
     if band_note:
         note += f"; Uncertainty: {band_note}"
     note += (s3_note or "")

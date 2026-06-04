@@ -4,7 +4,7 @@ import pandas as pd
 from src.data.historical import daily_from_runner_rows
 from src.data.merge import build_target_daily_series, merge_hist_and_live_no_gaps, merge_upstream_daily_series
 from src.data.upstream import upstream_daily_from_frame
-from src.data.validation import recent_missing_dates, stable_live_daily_until
+from src.data.validation import anchor_fallback_reason, recent_missing_dates, stable_live_daily_until
 
 
 def test_merge_target_series_prefers_newer_inputs_and_fills_small_gaps():
@@ -66,6 +66,26 @@ def test_validation_helpers_keep_stable_live_values_and_report_recent_missing_da
         pd.Timestamp("2025-01-02").date(),
         pd.Timestamp("2025-01-04").date(),
     ]
+
+
+def test_anchor_fallback_reason_reports_latest_window_gap():
+    dates = list(pd.date_range("2025-01-01", periods=160, freq="D").date)
+    dates += list(pd.date_range("2025-12-01", periods=10, freq="D").date)
+    water_daily = pd.Series(range(len(dates)), index=dates, dtype=float)
+
+    selected_anchor = pd.Timestamp("2025-06-09").date()
+    diag = anchor_fallback_reason(
+        water_daily,
+        selected_anchor=selected_anchor,
+        need=150,
+        stale_threshold_days=3,
+    )
+
+    assert diag["latest_finite_date"] == pd.Timestamp("2025-12-10").date()
+    assert diag["selected_anchor"] == selected_anchor
+    assert diag["is_stale"] is True
+    assert diag["latest_window_missing_count"] > 0
+    assert "missing water-level values" in diag["reason"]
 
 
 def test_historical_rows_and_upstream_merge_helpers():

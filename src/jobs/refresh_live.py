@@ -72,6 +72,39 @@ def load_backfill_parquet(path: Path | None) -> pd.DataFrame:
     return df
 
 
+def backfill_frame_from_records(records) -> pd.DataFrame:
+    """Build a backfill frame from JSON cache/status records."""
+    if not records:
+        return pd.DataFrame(columns=["date", "h"])
+
+    df = pd.DataFrame(records)
+    if "date" not in df.columns or "h" not in df.columns:
+        return pd.DataFrame(columns=["date", "h"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df["h"] = pd.to_numeric(df["h"], errors="coerce")
+    return df.dropna(subset=["date", "h"]).sort_values("date").reset_index(drop=True)
+
+
+def _load_existing_storage_backfill(*, storage, station_code: str) -> pd.DataFrame:
+    """Read the existing storage live cache so refresh jobs remain cumulative."""
+    if storage is None:
+        return pd.DataFrame(columns=["date", "h"])
+
+    cache_ref = _runtime_ref(storage, station_code, LIVE_CACHE_FILENAME, area="cache")
+    try:
+        payload = storage.read_json(cache_ref)
+    except Exception as exc:
+        print(f"[refresh_live][existing][warn] no existing live cache: {exc!r}")
+        return pd.DataFrame(columns=["date", "h"])
+
+    records = payload.get("records", []) if isinstance(payload, dict) else []
+    df = backfill_frame_from_records(records)
+    dmin = df["date"].dt.date.min() if len(df) else None
+    dmax = df["date"].dt.date.max() if len(df) else None
+    print(f"[refresh_live][existing] storage cache rows={len(df)}, range={dmin} -> {dmax}")
+    return df
+
+
 def stable_live_rows(live_daily, cutoff) -> pd.DataFrame:
     """Return stable live rows through the cutoff date in backfill parquet schema."""
     stable_rows = []
@@ -92,6 +125,8 @@ def merge_backfill_frames(df_backfill: pd.DataFrame, df_new: pd.DataFrame) -> pd
     df_all = pd.concat([df_backfill, df_new], ignore_index=True) if len(df_new) else df_backfill
     if len(df_all) > 0:
         df_all["date"] = pd.to_datetime(df_all["date"]).dt.normalize()
+        df_all["h"] = pd.to_numeric(df_all["h"], errors="coerce")
+        df_all = df_all.dropna(subset=["date", "h"])
         df_all = df_all.sort_values("date").groupby("date", as_index=False).last()
         df_all = df_all.sort_values("date").reset_index(drop=True)
     return df_all
@@ -260,8 +295,20 @@ def refresh_live_job(
     existing_path = None
     if download_existing:
         existing_path = _download_existing_backfill(repo_id=repo_id or "", token=token or "", out_dir=out)
+        if existing_path is None and (out / BACKFILL_FILENAME).exists():
+            existing_path = out / BACKFILL_FILENAME
+    elif storage is None:
+        local_existing = out / BACKFILL_FILENAME
+        if local_existing.exists():
+            existing_path = local_existing
 
-    df_backfill = load_backfill_parquet(existing_path)
+    if storage is not None:
+        df_backfill = _load_existing_storage_backfill(storage=storage, station_code=station_code)
+    else:
+        df_backfill = load_backfill_parquet(existing_path)
+        dmin_existing = df_backfill["date"].dt.date.min() if len(df_backfill) else None
+        dmax_existing = df_backfill["date"].dt.date.max() if len(df_backfill) else None
+        print(f"[refresh_live][existing] parquet rows={len(df_backfill)}, range={dmin_existing} -> {dmax_existing}")
 
     if live_daily is None:
         live_daily = _fetch_live_daily(
@@ -272,6 +319,9 @@ def refresh_live_job(
 
     cutoff = today_utc7_date() - pd.Timedelta(days=1)
     df_new = stable_live_rows(live_daily, cutoff)
+    dmin_new = df_new["date"].dt.date.min() if len(df_new) else None
+    dmax_new = df_new["date"].dt.date.max() if len(df_new) else None
+    print(f"[refresh_live][api] stable rows={len(df_new)}, range={dmin_new} -> {dmax_new}")
     df_all = merge_backfill_frames(df_backfill, df_new)
 
     dmin = df_all["date"].dt.date.min() if len(df_all) else None

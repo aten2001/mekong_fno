@@ -62,6 +62,8 @@ def test_dockerignore_excludes_local_runtime_and_cache_artifacts():
     assert required.issubset(ignored)
     assert "/data" not in ignored
     assert "data" not in ignored
+    assert "data/*.csv" not in ignored
+    assert "*.csv" not in ignored
 
 
 def test_docker_docs_include_local_build_run_and_endpoint_checks():

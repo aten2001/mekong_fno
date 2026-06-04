@@ -67,6 +67,76 @@ def test_refresh_live_job_writes_runtime_artifacts_through_storage():
         _cleanup(root)
 
 
+def test_refresh_live_job_keeps_cumulative_local_backfill(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    existing = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-05-01", "2020-05-02", "2020-05-03"]),
+            "h": [10.0, 11.0, 12.0],
+        }
+    )
+    existing.to_parquet(out_dir / "live_backfill.parquet", index=False)
+
+    live_daily = pd.Series(
+        [13.5, 14.0, 15.0],
+        index=pd.to_datetime(["2020-05-03", "2020-05-04", "2020-05-05"]).date,
+    )
+
+    result = refresh_live_job(
+        out_dir=out_dir,
+        station_code="014501",
+        live_daily=live_daily,
+        download_existing=False,
+    )
+
+    saved = pd.read_parquet(out_dir / "live_backfill.parquet")
+
+    assert result["ok"] is True
+    assert saved["date"].dt.strftime("%Y-%m-%d").tolist() == [
+        "2020-05-01",
+        "2020-05-02",
+        "2020-05-03",
+        "2020-05-04",
+        "2020-05-05",
+    ]
+    assert saved["h"].tolist() == [10.0, 11.0, 13.5, 14.0, 15.0]
+    assert result["range"] == ["2020-05-01", "2020-05-05"]
+
+
+def test_refresh_live_job_keeps_cumulative_storage_cache():
+    root, storage = _workspace_storage()
+    try:
+        cache_path = storage.runtime_path("014501", "live_cache.json", area="cache")
+        storage.write_json(
+            cache_path,
+            {
+                "records": [
+                    {"date": "2020-05-01", "h": 10.0},
+                    {"date": "2020-05-02", "h": 11.0},
+                ]
+            },
+        )
+        live_daily = pd.Series(
+            [12.0],
+            index=pd.to_datetime(["2020-05-03"]).date,
+        )
+
+        result = refresh_live_job(
+            station_code="014501",
+            live_daily=live_daily,
+            storage=storage,
+            download_existing=False,
+        )
+
+        cache = storage.read_json(cache_path)
+        assert result["range"] == ["2020-05-01", "2020-05-03"]
+        assert cache["rows"] == 3
+        assert [r["date"] for r in cache["records"]] == ["2020-05-01", "2020-05-02", "2020-05-03"]
+    finally:
+        _cleanup(root)
+
+
 def test_refresh_backtest_job_writes_summary_through_storage():
     root, storage = _workspace_storage()
     try:

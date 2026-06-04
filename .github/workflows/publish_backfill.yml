@@ -26,6 +26,7 @@ jobs:
           HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           STATION_CODE: "014501"
+          HF_PUBLISH: "1"
         run: |
           python scripts/update_dataset_backfill.py
 
