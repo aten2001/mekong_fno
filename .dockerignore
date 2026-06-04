@@ -13,7 +13,6 @@ env
 .env
 .runtime
 data/runtime
-/data
 logs
 tmp
 temp
